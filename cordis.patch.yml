@@ -1,0 +1,3 @@
+- insert:
+    - id: diff-review
+      name: 'dsh-review-checkout'
