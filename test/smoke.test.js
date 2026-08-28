@@ -63,9 +63,9 @@ test.after(() => {
   }
 })
 
-test('inject declares only the agents hard dependency', () => {
+test('inject declares only the hard deps (agents + base tools registry)', () => {
   assert.ok(Array.isArray(inject))
-  assert.deepEqual(inject, ['agents'])
+  assert.deepEqual(inject, ['agents', 'tools'])
 })
 
 test('apply boots and registers the /diff-review prefix', () => {
