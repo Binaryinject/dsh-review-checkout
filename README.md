@@ -29,7 +29,7 @@ Then make sure the bundle patch is present in your profile (`~/.dsh/profiles/<pr
 
 | Area | Detail |
 |---|---|
-| Data channel | Official `connection.api.sessions.history` via the DSH transport (RPC fetch on web, IPC bridge on Desktop) — no self-built HTTP routes; works in the layered Desktop composition |
+| Data channel | Official `session/follow` + `session/page` RPC via the DSH transport (RPC fetch on web, IPC bridge on Desktop) — no self-built HTTP routes; works in the layered Desktop composition |
 | Per-turn cards | Latest turn only: `已编辑 client.js 等 2 个文件 ＋N −M`, file list with per-file stats (relative paths, full path on hover), `撤销` (Web composition only), `审核` jumps to the review tab; clicking the card anywhere jumps too |
 | Review tab | Latest-turn aggregation: file cards → expandable syntax-highlighted diffs (hunks, line numbers, `+ / −`), expand/collapse all, refresh, clear |
 | Live refresh | Polls every 5 s; running-status pill and theme sync included |
@@ -45,7 +45,7 @@ Then make sure the bundle patch is present in your profile (`~/.dsh/profiles/<pr
 ## Architecture
 
 - `lib/index.js` (host): records `write`/`edit` tool calls into per-session state; exposes agent API helpers; atomic JSON state persistence
-- `lib/client.js` (client): loads session history through the official channel (`api.sessions.history`, paged window), parses `tool/call` / `tool/result` into review records, renders the Codex-style UI
+- `lib/client.js` (client): loads session history through the official channel (`session/follow` snapshot + `session/page` paging), parses `tool/call` / `tool/result` into review records, renders the Codex-style UI
 - Third-party constraints honored: no private-layer services (`webServer`, `connection` proxies), no cross-fiber RPC interception — only official slot registrations and the history API
 
 ## Compatibility
@@ -65,7 +65,7 @@ The client bundle is loaded by DSH's `client-modules`; host changes need a Deskt
 
 ## Credits
 
-Inspired by [cirelir/dsh-change-review](https://github.com/cirelir/dsh-change-review). Built on community findings around the official `api.sessions.history` channel.
+Inspired by [cirelir/dsh-change-review](https://github.com/cirelir/dsh-change-review). Built on community findings around the official session-history channel.
 
 ## License
 

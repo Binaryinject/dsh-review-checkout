@@ -29,7 +29,7 @@ dsh plugin add dsh-review-checkout
 
 | 模块 | 说明 |
 |---|---|
-| 数据通道 | 官方 `connection.api.sessions.history`（Web 走 RPC fetch，Desktop 走 IPC 桥）——无自建 HTTP 路由，兼容 Desktop 分层组合 |
+| 数据通道 | 官方 `session/follow` + `session/page` RPC（Web 走 RPC fetch，Desktop 走 IPC 桥）——无自建 HTTP 路由，兼容 Desktop 分层组合 |
 | 每轮卡片 | 仅最新一轮：`已编辑 client.js 等 2 个文件 ＋N −M`、文件清单（相对路径，悬停完整路径）、`撤销`（仅 Web 组合）、`审核` 跳审查 tab；整卡可点击 |
 | 审查 tab | 最新一轮聚合：文件卡 → 展开语法高亮 diff（hunks/行号/`+ −`），展开/收起全部、刷新、清空 |
 | 实时刷新 | 5s 轮询；含运行态小胶囊与主题同步 |
@@ -45,7 +45,7 @@ dsh plugin add dsh-review-checkout
 ## 架构
 
 - `lib/index.js`（Host）：把 `write`/`edit` 工具调用写入会话状态；原子 JSON 持久化
-- `lib/client.js`（客户端）：经官方通道 `api.sessions.history`（分页窗口）加载会话历史，解析 `tool/call` / `tool/result` 为审查记录，渲染 Codex 风格 UI
+- `lib/client.js`（客户端）：经官方通道 `session/follow`（snapshot）+ `session/page`（分页）加载会话历史，解析 `tool/call` / `tool/result` 为审查记录，渲染 Codex 风格 UI
 - 第三方约束：不碰私有层服务（`webServer`、`connection` 代理）、不做跨 fiber RPC 拦截——仅官方 slot 注册与历史 API
 
 ## 兼容性
@@ -65,7 +65,7 @@ pnpm test        # 24 个单元 + 冒烟测试
 
 ## 致谢
 
-灵感来自 [cirelir/dsh-change-review](https://github.com/cirelir/dsh-change-review)，基于社区对官方 `api.sessions.history` 通道的调研成果构建。
+灵感来自 [cirelir/dsh-change-review](https://github.com/cirelir/dsh-change-review)，基于社区对官方会话历史通道的调研成果构建。
 
 ## License
 
