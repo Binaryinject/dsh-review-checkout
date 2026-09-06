@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -13,6 +13,25 @@ function sandboxBaseUrl() {
 }
 const tmpDirs = []
 function track(dir) { tmpDirs.push(dir); return dir }
+
+/** Extract one named function from the shipped client bundle for behavior tests. */
+function clientFunction(name) {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  const start = source.indexOf(`function ${name}(`)
+  assert.notEqual(start, -1, `client function ${name} exists`)
+  const open = source.indexOf('{', start)
+  let depth = 0
+  let end = -1
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '{') depth++
+    else if (source[i] === '}') {
+      depth--
+      if (depth === 0) { end = i + 1; break }
+    }
+  }
+  assert.notEqual(end, -1, `client function ${name} has balanced braces`)
+  return new Function(`${source.slice(start, end)}; return ${name}`)()
+}
 
 /** Minimal Cordis ctx with an official-shape webServer. */
 function makeCtx({ withWebServer = true } = {}) {
@@ -83,6 +102,24 @@ test.after(() => {
 test('inject declares only the hard deps (agents + base tools registry)', () => {
   assert.ok(Array.isArray(inject))
   assert.deepEqual(inject, ['agents', 'tools'])
+})
+
+test('client parser records nested run_code write/edit dispatches', () => {
+  const parseReviewEvents = clientFunction('parseReviewEvents')
+  const files = parseReviewEvents([
+    { type: 'turn/start', time: 1, data: { turn: 7 } },
+    { type: 'tool/call', time: 2, data: { callId: 'direct', name: 'edit', arguments: { file_path: 'direct.js', old_string: 'a', new_string: 'b' } } },
+    { type: 'tool/result', time: 3, data: { callId: 'direct', message: {} } },
+    { type: 'tool/code-dispatch', time: 4, data: { name: 'edit', isError: false, arguments: { file_path: 'nested.js', old_string: 'x', new_string: 'y' } } },
+    { type: 'tool/code-dispatch', time: 5, data: { name: 'write', isError: false, arguments: JSON.stringify({ file_path: 'created.js', content: 'hello\n' }) } },
+    { type: 'tool/code-dispatch', time: 6, data: { name: 'edit', isError: true, arguments: { file_path: 'failed.js', old_string: 'x', new_string: 'z' } } }
+  ])
+
+  assert.deepEqual([...files.keys()], ['direct.js', 'nested.js', 'created.js'])
+  assert.equal(files.get('nested.js').ops[0].kind, 'edit')
+  assert.equal(files.get('nested.js').ops[0].turn, 7)
+  assert.equal(files.get('created.js').ops[0].content, 'hello\n')
+  assert.equal(files.has('failed.js'), false)
 })
 
 test('apply boots and registers the /diff-review prefix', () => {
