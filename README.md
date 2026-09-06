@@ -4,8 +4,8 @@ File-change review for [DeepSeek Harness](https://github.com/deepseek-ai/dsh) (D
 
 Every file the agent writes or edits inside a session is tracked and surfaced as:
 
-- **Codex-style per-turn cards** at the tail of each turn — file-type badge, `＋N −M` stats, timestamp, plus a file list with per-file stats (relative paths), one-click jump to the review tab
-- **A review tab** (conversation view) aggregating the **latest turn** — file cards with line numbers, `+ / −` prefixes, edge color bars and **syntax highlighting** (JS/TS/JSON/C++/Python/YAML/Shell/CMake… auto-detected by extension)
+- **Codex-style per-turn cards** at the tail of each turn (recording **that turn's** changes) — file-type badge, `＋N −M` stats, timestamp, plus a file list with per-file stats (full paths); clicking a single file jumps to the review tab and expands only that file
+- **A review tab** (conversation view) showing the **selected turn** (per card jump) — file cards with line numbers, `+ / −` prefixes, edge color bars and **syntax highlighting** (JS/TS/JSON/C++/Python/YAML/Shell/CMake… auto-detected by extension), with a sticky "current file" header that follows scrolling (click to collapse/expand)
 - **A live pill** above the composer while the session is running — `N 个文件已更改 ＋X −X` (auto-hides when idle)
 - **Theme-aware theming** — light/dark color presets stored independently, auto-follows the DSH theme; custom tooltips and text selection styled with DSH design tokens
 
@@ -30,11 +30,11 @@ Then make sure the bundle patch is present in your profile (`~/.dsh/profiles/<pr
 | Area | Detail |
 |---|---|
 | Data channel | Official `session/follow` + `session/page` RPC via the DSH transport (RPC fetch on web, IPC bridge on Desktop) — no self-built HTTP routes; works in the layered Desktop composition |
-| Per-turn cards | Latest turn only: `已编辑 client.js 等 2 个文件 ＋N −M`, file list with per-file stats (relative paths, full path on hover), `撤销` (Web composition only), `审核` jumps to the review tab; clicking the card anywhere jumps too |
-| Review tab | Latest-turn aggregation: file cards → expandable syntax-highlighted diffs (hunks, line numbers, `+ / −`), expand/collapse all, refresh, clear |
+| Per-turn cards | One card per turn («本轮无文件修改» for a turn with no changes): `已编辑 D:\...\client.js 等 2 个文件 ＋N −M`, file list with per-file stats (full paths; click a file to open the review tab with only that file expanded), `撤销` (issues a reversed op sequence for that turn only), `审核` jumps to the review tab; clicking the card anywhere jumps too |
+| Review tab | Turn-scoped (matches the card you jumped from): file cards → expandable syntax-highlighted diffs (hunks, line numbers, `+ / −`), expand/collapse all, refresh, clear; each file header is sticky (switches while scrolling, click to collapse/expand it) |
 | Live refresh | Polls every 5 s; running-status pill and theme sync included |
 | Colors | Two independent presets (light/dark, 12 colors each) with a tab switcher in **设置 → 修改审查**; auto-switches with the DSH theme; CSS `::selection` follows the theme |
-| Revert | Per-op and whole-file revert (busy-guarded, confirmation dialog) — requires the `webServer`-hosted channel, so it works on `dsh --profile web`; hidden on Desktop where the channel is not mounted |
+| Revert | Per-turn cards emit a `diff_review_revert` op sequence (newest first, so only that turn's changes are rolled back) — requires the `webServer`-hosted channel, so it works on `dsh --profile web`; hidden on Desktop where the channel is not mounted |
 | Misc | Editor picker (session header), custom themed tooltips, path-aware display, atomic state writes |
 
 ## Configuration
