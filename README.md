@@ -31,10 +31,10 @@ Then make sure the bundle patch is present in your profile (`~/.dsh/profiles/<pr
 |---|---|
 | Data channel | Official `session/follow` + `session/page` RPC via the DSH transport (RPC fetch on web, IPC bridge on Desktop) — no self-built HTTP routes; works in the layered Desktop composition |
 | Per-turn cards | One card per turn («本轮无文件修改» for a turn with no changes): `已编辑 D:\...\client.js 等 2 个文件 ＋N −M`, file list with per-file stats (full paths; click a file to open the review tab with only that file expanded), `撤销` (issues a reversed op sequence for that turn only), `审核` jumps to the review tab; clicking the card anywhere jumps too |
-| Review tab | Turn-scoped (matches the card you jumped from): file cards → expandable syntax-highlighted diffs (hunks, line numbers, `+ / −`), expand/collapse all, refresh, clear; each file header is sticky (switches while scrolling, click to collapse/expand it) |
+| Review tab | Turn-scoped (matches the card you jumped from), with a **「双视图 / 列表」switcher**: split view (left file list + right detail pane, per-file `还原` in the header) or card list (expandable syntax-highlighted diffs, exactly one file open at a time, sticky file headers); refresh, clear; chat-card jumps land on the focused file in either mode |
 | Live refresh | Polls every 5 s; running-status pill and theme sync included |
 | Colors | Two independent presets (light/dark, 12 colors each) with a tab switcher in **设置 → 修改审查**; auto-switches with the DSH theme; CSS `::selection` follows the theme |
-| Revert | Per-turn cards emit a `diff_review_revert` op sequence (newest first, so only that turn's changes are rolled back) — requires the `webServer`-hosted channel, so it works on `dsh --profile web`; hidden on Desktop where the channel is not mounted |
+| Revert | Per-turn cards emit a `diff_review_revert` op sequence (newest first, so only that turn's changes are rolled back), and the review detail pane has a `还原` button for the focused file — the tool is registered on the official base-layer registry via `@deepseek-ai/dsh-tools` |
 | Misc | Editor picker (session header), custom themed tooltips, path-aware display, atomic state writes |
 
 ## Configuration
