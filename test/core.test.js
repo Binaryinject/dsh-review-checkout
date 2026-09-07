@@ -4,8 +4,9 @@ import { mkdtempSync, readFileSync, readdirSync, writeFileSync, rmSync } from 'n
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  cap, detectEditors, diffHunks, diffLines, isSafeRecordedPath, loadSessions,
-  merge3, serializeSessions, splitLines, writeJsonAtomicSync
+  cap, detectEditors, diffHunks, diffLines, isSafeRecordedPath, latestWindowOf,
+  loadSessions, merge3, opInLatestWindow, serializeSessions, splitLines,
+  writeJsonAtomicSync
 } from '../lib/index.js'
 
 test('cap truncates at MAX_CHARS and stringifies non-strings', () => {
@@ -186,4 +187,23 @@ test('detectEditors returns a well-formed list without throwing', () => {
     assert.equal(typeof ed.detected, 'boolean')
     assert.equal(typeof ed.openArgs, 'function')
   }
+})
+
+test('latestWindowOf / opInLatestWindow: newest labeled turn + newer in-flight ops only', () => {
+  const files = new Map([
+    ['a.js', { path: 'a.js', cwd: '/w', ops: [
+      { kind: 'edit', at: 10, turn: 2 },          // older labeled turn
+      { kind: 'write', at: 100, turn: 5 },        // newest labeled turn
+      { kind: 'write', at: 50, turn: 0 },         // old unlabeled (cut window) — dropped
+      { kind: 'edit', at: 200, turn: 0 },         // in-flight unlabeled — kept
+      { kind: 'edit', at: 300, turn: undefined }  // in-flight unlabeled — kept
+    ] }]
+  ])
+  const w = latestWindowOf(files)
+  assert.deepEqual(w, { latestTurn: 5, latestTaggedAt: 100 })
+  assert.equal(opInLatestWindow({ turn: 5, at: 100 }, 5, 100), true)
+  assert.equal(opInLatestWindow({ turn: 0, at: 200 }, 5, 100), true)
+  assert.equal(opInLatestWindow({ turn: undefined, at: 300 }, 5, 100), true)
+  assert.equal(opInLatestWindow({ turn: 0, at: 50 }, 5, 100), false)
+  assert.equal(opInLatestWindow({ turn: 2, at: 10 }, 5, 100), false)
 })
