@@ -162,6 +162,19 @@ test('focusFile: exactly one card open at a time (mutually exclusive list expans
   assert.deepEqual(focusFile(null, ''), {})
 })
 
+test('inLatestWindow: pill counts newest labeled turn + newer unlabeled ops only', () => {
+  const inLatestWindow = clientFunction('inLatestWindow')
+  // newest labeled turn ops always count
+  assert.equal(inLatestWindow(3, { turn: 3, at: 100 }, 100), true)
+  // unlabeled op newer than the newest labeled turn's last op: in-flight turn
+  assert.equal(inLatestWindow(3, { turn: 0, at: 200 }, 100), true)
+  assert.equal(inLatestWindow(3, { turn: undefined, at: 150 }, 100), true)
+  // older unlabeled op (window cut inside an earlier turn): dropped
+  assert.equal(inLatestWindow(3, { turn: 0, at: 50 }, 100), false)
+  // older labeled turn: dropped
+  assert.equal(inLatestWindow(3, { turn: 2, at: 300 }, 100), false)
+})
+
 test('apply boots and registers the /diff-review prefix', () => {
   const { ctx, listeners, disposers, routes } = makeCtx({ withWebServer: true })
   assert.doesNotThrow(() => apply(ctx))
