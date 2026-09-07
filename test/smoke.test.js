@@ -151,6 +151,14 @@ test('revert command builder: per-op newest-first + whole-file fallback + quote 
   assert.equal(revertCmdFor('', null), '')
 })
 
+test('expandFile: adds target while keeping the rest (shared split/card memory)', () => {
+  const expandFile = clientFunction('expandFile')
+  assert.deepEqual(expandFile({ a: true }, 'b'), { a: true, b: true })
+  assert.deepEqual(expandFile(null, 'a'), { a: true })
+  assert.deepEqual(expandFile({ a: true }, ''), { a: true })
+  assert.deepEqual(expandFile({ a: true }, 'a'), { a: true })
+})
+
 test('apply boots and registers the /diff-review prefix', () => {
   const { ctx, listeners, disposers, routes } = makeCtx({ withWebServer: true })
   assert.doesNotThrow(() => apply(ctx))
