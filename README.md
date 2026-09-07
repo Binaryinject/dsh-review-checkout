@@ -1,21 +1,21 @@
 # dsh-review-checkout
 
-File-change review for [DeepSeek Harness](https://github.com/deepseek-ai/dsh) (DSH) sessions — a hardened, Codex-style rewrite of `cirelir/dsh-change-review` for DSH Desktop and `dsh --profile web`.
+[DeepSeek Harness](https://github.com/deepseek-ai/dsh)（DSH）**会话修改审查插件** —— [cirelir/dsh-change-review](https://github.com/cirelir/dsh-change-review) 的加固 + Codex 风格重构版，适配 DSH Desktop 与 `dsh --profile web`。
 
-Every file the agent writes or edits inside a session is tracked and surfaced as:
+会话内 `write`/`edit` 工具调用会被追踪并以以下形态呈现：
 
-- **Codex-style per-turn cards** at the tail of each turn (recording **that turn's** changes) — file-type badge, `＋N −M` stats, timestamp, plus a file list with per-file stats (full paths); clicking a single file jumps to the review tab and expands only that file
-- **A review tab** (conversation view) showing the **selected turn** (per card jump) — file cards with line numbers, `+ / −` prefixes, edge color bars and **syntax highlighting** (JS/TS/JSON/C++/Python/YAML/Shell/CMake… auto-detected by extension), with a sticky "current file" header that follows scrolling (click to collapse/expand)
-- **A live pill** above the composer while the session is running — `N 个文件已更改 ＋X −X` (auto-hides when idle)
-- **Theme-aware theming** — light/dark color presets stored independently, auto-follows the DSH theme; custom tooltips and text selection styled with DSH design tokens
+- **Codex 风格每轮卡片**（对话流每轮尾部，记录**该轮**的修改）—— 文件类型徽章、`＋N −M` 统计、时间戳，多文件时列出清单（**完整路径** + 每文件统计，单击单个文件跳审查 tab 并只展开它）；点击卡片任意处跳转审查 tab
+- **审查 tab**（会话视图）—— 按卡片跳转的**对应轮次**展示：文件卡 → 展开语法高亮 diff（行号、`+ / −` 前缀、左缘色条；按扩展名自动识别 JS/TS/JSON/C++/Python/YAML/Shell/CMake 等），顶部吸顶「当前文件」标题条随滚动切换并可折叠/展开
+- **运行中小胶囊**（会话进行中，输入框上方）—— `N 个文件已更改 ＋X −X`，空闲自动隐藏
+- **主题化 UI** —— 深浅两套独立配色、自动跟随 DSH 主题；tooltip 与文本选区使用 DSH 设计变量
 
-## Installation
+## 安装
 
 ```bash
 dsh plugin add dsh-review-checkout
 ```
 
-Then make sure the bundle patch is present in your profile (`~/.dsh/profiles/<profile>/cordis.patch.yml`):
+确认 profile 配置注册了 bundle patch（`~/.dsh/profiles/<profile>/cordis.patch.yml`）：
 
 ```yaml
 - insert:
@@ -23,49 +23,49 @@ Then make sure the bundle patch is present in your profile (`~/.dsh/profiles/<pr
       name: 'dsh-review-checkout'
 ```
 
-**Restart DSH Desktop** (or `dsh --profile web`) after a host-side change. Client-side changes only need a page refresh.
+**Host 端改动需重启 DSH Desktop**（或 `dsh --profile web`）；客户端改动仅需刷新页面。
 
-## Features
+## 功能
 
-| Area | Detail |
+| 模块 | 说明 |
 |---|---|
-| Data channel | Official `session/follow` + `session/page` RPC via the DSH transport (RPC fetch on web, IPC bridge on Desktop) — no self-built HTTP routes; works in the layered Desktop composition |
-| Per-turn cards | One card per turn («本轮无文件修改» for a turn with no changes): `已编辑 D:\...\client.js 等 2 个文件 ＋N −M`, file list with per-file stats (full paths; click a file to open the review tab with only that file expanded), `撤销` (issues a reversed op sequence for that turn only), `审核` jumps to the review tab; clicking the card anywhere jumps too |
-| Review tab | Turn-scoped (matches the card you jumped from), with a **「双视图 / 列表」switcher**: split view (left file list + right detail pane, per-file `还原` in the header) or card list (expandable syntax-highlighted diffs, exactly one file open at a time, sticky file headers); refresh, clear; chat-card jumps land on the focused file in either mode |
-| Live refresh | Polls every 5 s; running-status pill and theme sync included |
-| Colors | Two independent presets (light/dark, 12 colors each) with a tab switcher in **设置 → 修改审查**; auto-switches with the DSH theme; CSS `::selection` follows the theme |
-| Revert | Per-turn cards emit a `diff_review_revert` op sequence (newest first, so only that turn's changes are rolled back), and the review detail pane has a `还原` button for the focused file — the tool is registered on the official base-layer registry via `@deepseek-ai/dsh-tools` |
-| Misc | Editor picker (session header), custom themed tooltips, path-aware display, atomic state writes |
+| 数据通道 | 官方 `session/follow` + `session/page` RPC（Web 走 RPC fetch，Desktop 走 IPC 桥）——无自建 HTTP 路由，兼容 Desktop 分层组合 |
+| 每轮卡片 | 每一轮一张（该轮无修改时显示「本轮无文件修改」）：`已编辑 D:\...\client.js 等 2 个文件 ＋N −M`、文件清单（**完整路径** + 每文件统计；单击单个文件跳审查 tab 并**只展开该文件**，其余收起）、`撤销`（按该轮生成倒序 op 序列，只撤回这一轮的修改）、`审核` 跳审查 tab；整卡可点击 |
+| 审查 tab | 从卡片跳转后按**对应轮次**展示，顶部有 **「双视图 / 列表」切换**：双视图 = 左侧文件列表 + 右侧详情面板（头部带该文件的 `还原` 按钮）；列表 = 每文件一张可展开卡片（语法高亮 diff、**同时只展开一个文件**、文件标题吸顶）；两种模式共享选中/展开状态，来回切换不丢失；刷新、清空 |
+| 实时刷新 | 5s 轮询；含运行态小胶囊与主题同步 |
+| 颜色 | 深浅两套独立预设（各 12 色），**设置 → 修改审查** tab 切换；自动跟随 DSH 主题；`::selection` 随主题 |
+| 撤回 | 每轮卡片按轮签发 `diff_review_revert` op 序列（最后一个操作开始倒序撤回，不影响其他轮的修改）；审查双视图详情面板头部也有该文件的 `还原` 按钮——工具注册在官方基础层工具注册表（`@deepseek-ai/dsh-tools`），Web 与 Desktop 均可用 |
+| 其他 | 编辑器选择器（会话头）、主题化自定义 tooltip、完整路径显示、原子写状态文件 |
 
-## Configuration
+## 配置
 
-- **设置 → 修改审查**: light/dark tabs, 12 colors each (add/del backgrounds & text, context rows, gutters, tab badge), preset buttons, persisted in `localStorage`
-- State file: `~/.dsh/profiles/<profile>/diff-review-state.json` (delete to reset recorded history)
+- **设置 → 修改审查**：浅色/深色两个 tab，各 12 色（增删行背景与文字、上下文行、行号、标签角标）、预设按钮，`localStorage` 持久化
+- 状态文件：`~/.dsh/profiles/<profile>/diff-review-state.json`（删除即清空审查历史）
 
-## Architecture
+## 架构
 
-- `lib/index.js` (host): records `write`/`edit` tool calls into per-session state; exposes agent API helpers; atomic JSON state persistence
-- `lib/client.js` (client): loads session history through the official channel (`session/follow` snapshot + `session/page` paging), parses `tool/call` / `tool/result` into review records, renders the Codex-style UI
-- Third-party constraints honored: no private-layer services (`webServer`, `connection` proxies), no cross-fiber RPC interception — only official slot registrations and the history API
+- `lib/index.js`（Host）：把 `write`/`edit` 工具调用写入会话状态；原子 JSON 持久化
+- `lib/client.js`（客户端）：经官方通道 `session/follow`（snapshot）+ `session/page`（分页）加载会话历史，解析 `tool/call` / `tool/result` 为审查记录，渲染 Codex 风格 UI
+- 第三方约束：不碰私有层服务（`webServer`、`connection` 代理）、不做跨 fiber RPC 拦截——仅官方 slot 注册与历史 API
 
-## Compatibility
+## 兼容性
 
-- ✅ DSH Desktop (layered scope — renderer + official slots)
-- ✅ `dsh --profile web` (full revert available)
-- ⚠️ Revert on Desktop is disabled by design (the private web-app layer owns `webServer`)
+- ✅ DSH Desktop（分层作用域：渲染器 + 官方 slot）
+- ✅ `dsh --profile web`（完整撤回）
+- ⚠️ Desktop 撤回按钮按设计禁用（`webServer` 在私有 web-app 层）
 
-## Development
+## 开发
 
 ```bash
 pnpm install
-pnpm test        # 24 unit + smoke tests
+pnpm test        # 24 个单元 + 冒烟测试
 ```
 
-The client bundle is loaded by DSH's `client-modules`; host changes need a Desktop restart, client changes only a page refresh.
+客户端 bundle 由 DSH `client-modules` 加载；Host 改动需重启 Desktop，客户端改动只需刷新。
 
-## Credits
+## 致谢
 
-Inspired by [cirelir/dsh-change-review](https://github.com/cirelir/dsh-change-review). Built on community findings around the official session-history channel.
+灵感来自 [cirelir/dsh-change-review](https://github.com/cirelir/dsh-change-review)，基于社区对官方会话历史通道的调研成果构建。
 
 ## License
 
