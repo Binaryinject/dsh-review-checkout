@@ -137,6 +137,20 @@ test('review jump predicate: applied only when turn scope + file selected + targ
   assert.equal(jumpApplied('turn', 'x.js', null, 3, 3), false)
 })
 
+test('revert command builder: per-op newest-first + whole-file fallback + quote escaping', () => {
+  const revertCmdFor = clientFunction('revertCmdFor')
+  const sections = [{ opIndex: 2 }, { kind: 'edit', opIndex: 0 }, { opIndex: 5 }]
+  assert.equal(
+    revertCmdFor('a"b.js', sections),
+    'diff_review_revert(path="a\\"b.js", op=5) → diff_review_revert(path="a\\"b.js", op=2) → diff_review_revert(path="a\\"b.js", op=0)'
+  )
+  // no op indices -> whole-file fallback
+  assert.equal(revertCmdFor('x.js', []), 'diff_review_revert(path="x.js")')
+  assert.equal(revertCmdFor('x.js', [{ kind: 'edit' }]), 'diff_review_revert(path="x.js")')
+  // no path -> no command
+  assert.equal(revertCmdFor('', null), '')
+})
+
 test('apply boots and registers the /diff-review prefix', () => {
   const { ctx, listeners, disposers, routes } = makeCtx({ withWebServer: true })
   assert.doesNotThrow(() => apply(ctx))
