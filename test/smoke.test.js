@@ -151,12 +151,15 @@ test('revert command builder: per-op newest-first + whole-file fallback + quote 
   assert.equal(revertCmdFor('', null), '')
 })
 
-test('expandFile: adds target while keeping the rest (shared split/card memory)', () => {
-  const expandFile = clientFunction('expandFile')
-  assert.deepEqual(expandFile({ a: true }, 'b'), { a: true, b: true })
-  assert.deepEqual(expandFile(null, 'a'), { a: true })
-  assert.deepEqual(expandFile({ a: true }, ''), { a: true })
-  assert.deepEqual(expandFile({ a: true }, 'a'), { a: true })
+test('focusFile: exactly one card open at a time (mutually exclusive list expansion)', () => {
+  const focusFile = clientFunction('focusFile')
+  // focusing a file collapses every other entry
+  assert.deepEqual(focusFile({ a: true, b: true }, 'c'), { c: true })
+  assert.deepEqual(focusFile({ a: true }, 'a'), { a: true })
+  // collapsing (empty path) closes all
+  assert.deepEqual(focusFile({ a: true }, ''), {})
+  assert.deepEqual(focusFile(null, 'a'), { a: true })
+  assert.deepEqual(focusFile(null, ''), {})
 })
 
 test('apply boots and registers the /diff-review prefix', () => {
