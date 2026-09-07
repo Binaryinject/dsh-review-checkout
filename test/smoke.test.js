@@ -122,6 +122,21 @@ test('client parser records nested run_code write/edit dispatches', () => {
   assert.equal(files.has('failed.js'), false)
 })
 
+test('review jump predicate: applied only when turn scope + file selected + target turn payload loaded', () => {
+  const jumpApplied = clientFunction('jumpApplied')
+  // "全部修改" (all-scope) list active: same file/turn must NOT be skipped —
+  // this is the regression where card jumps from the list mode never expanded
+  assert.equal(jumpApplied('all', 'a.js', 'a.js', 3, 3), false)
+  // user manually picked a different file, card click must re-apply
+  assert.equal(jumpApplied('turn', 'b.js', 'a.js', 3, 3), false)
+  // target turn payload not loaded yet (turnShown is another turn)
+  assert.equal(jumpApplied('turn', 'a.js', 'a.js', 5, 3), false)
+  // fully applied: turn scope, file selected, target turn data loaded
+  assert.equal(jumpApplied('turn', 'a.js', 'a.js', 3, 3), true)
+  // no jump target at all
+  assert.equal(jumpApplied('turn', 'x.js', null, 3, 3), false)
+})
+
 test('apply boots and registers the /diff-review prefix', () => {
   const { ctx, listeners, disposers, routes } = makeCtx({ withWebServer: true })
   assert.doesNotThrow(() => apply(ctx))
