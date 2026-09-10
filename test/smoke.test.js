@@ -106,7 +106,7 @@ test('inject declares only the hard deps (agents + base tools registry)', () => 
 
 test('client parser records nested run_code write/edit dispatches', () => {
   const parseReviewEvents = clientFunction('parseReviewEvents')
-  const files = parseReviewEvents([
+  const parsed = parseReviewEvents([
     { type: 'turn/start', time: 1, data: { turn: 7 } },
     { type: 'tool/call', time: 2, data: { callId: 'direct', name: 'edit', arguments: { file_path: 'direct.js', old_string: 'a', new_string: 'b' } } },
     { type: 'tool/result', time: 3, data: { callId: 'direct', message: {} } },
@@ -114,12 +114,16 @@ test('client parser records nested run_code write/edit dispatches', () => {
     { type: 'tool/code-dispatch', time: 5, data: { name: 'write', isError: false, arguments: JSON.stringify({ file_path: 'created.js', content: 'hello\n' }) } },
     { type: 'tool/code-dispatch', time: 6, data: { name: 'edit', isError: true, arguments: { file_path: 'failed.js', old_string: 'x', new_string: 'z' } } }
   ])
+  const files = parsed.files
 
   assert.deepEqual([...files.keys()], ['direct.js', 'nested.js', 'created.js'])
   assert.equal(files.get('nested.js').ops[0].kind, 'edit')
   assert.equal(files.get('nested.js').ops[0].turn, 7)
   assert.equal(files.get('created.js').ops[0].content, 'hello\n')
   assert.equal(files.has('failed.js'), false)
+  // The parser also reports the newest labeled turn: an in-flight turn with no
+  // write/edit yet stays distinguishable from the last turn that had edits.
+  assert.equal(parsed.activeTurn, 7)
 })
 
 test('review jump predicate: applied only when turn scope + file selected + target turn payload loaded', () => {
@@ -173,6 +177,19 @@ test('inLatestWindow: pill counts newest labeled turn + newer unlabeled ops only
   assert.equal(inLatestWindow(3, { turn: 0, at: 50 }, 100), false)
   // older labeled turn: dropped
   assert.equal(inLatestWindow(3, { turn: 2, at: 300 }, 100), false)
+})
+
+test('inLatestWindow: a brand-new turn with no write/edit yet drops the previous turn', () => {
+  const inLatestWindow = clientFunction('inLatestWindow')
+  // Regression: turn 6 just started (turn/start landed, no write/edit yet) while
+  // turn 5 was the last turn that edited files. Querying the pill/badge window
+  // with the ACTIVE turn (6) must drop turn 5 — otherwise the running pill keeps
+  // showing the previous turn's file changes in a fresh turn.
+  assert.equal(inLatestWindow(6, { turn: 5, at: 999 }, 0), false)
+  // ops of the active turn itself still count
+  assert.equal(inLatestWindow(6, { turn: 6, at: 10 }, 10), true)
+  // an unlabeled in-flight op newer than the active turn's last op still counts
+  assert.equal(inLatestWindow(6, { turn: 0, at: 11 }, 10), true)
 })
 
 test('apply boots and registers the /diff-review prefix', () => {
