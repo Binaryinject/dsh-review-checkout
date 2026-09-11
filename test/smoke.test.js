@@ -6,10 +6,14 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { apply, isLoopbackRequest, inject } from '../lib/index.js'
 
-/** Sandboxed profile dir per test, so flushes never touch real user data. */
+/** Sandboxed profile dir per test, so flushes never touch real user data.
+ *  The trailing slash matters: a backslash encodes to %5C (a plain character,
+ *  not a separator), so relative URL resolution would replace the last path
+ *  segment and collapse every test's state file onto one shared
+ *  /tmp/diff-review-state.json across runs. */
 function sandboxBaseUrl() {
   const dir = mkdtempSync(join(tmpdir(), 'drv-smoke-'))
-  return { dir, url: pathToFileURL(dir + '\\').href }
+  return { dir, url: pathToFileURL(dir + '/').href }
 }
 const tmpDirs = []
 function track(dir) { tmpDirs.push(dir); return dir }
@@ -112,15 +116,29 @@ test('client parser records nested run_code write/edit dispatches', () => {
     { type: 'tool/result', time: 3, data: { callId: 'direct', message: {} } },
     { type: 'tool/code-dispatch', time: 4, data: { name: 'edit', isError: false, arguments: { file_path: 'nested.js', old_string: 'x', new_string: 'y' } } },
     { type: 'tool/code-dispatch', time: 5, data: { name: 'write', isError: false, arguments: JSON.stringify({ file_path: 'created.js', content: 'hello\n' }) } },
-    { type: 'tool/code-dispatch', time: 6, data: { name: 'edit', isError: true, arguments: { file_path: 'failed.js', old_string: 'x', new_string: 'z' } } }
+    { type: 'tool/code-dispatch', time: 6, data: { name: 'edit', isError: true, arguments: { file_path: 'failed.js', old_string: 'x', new_string: 'z' } } },
+    // DSH renamed tool/code-dispatch to tool/ptc-dispatch (object arguments);
+    // the -start twin carries no result and must be ignored.
+    { type: 'tool/ptc-dispatch-start', time: 7, data: { name: 'write', arguments: { file_path: 'start-only.js', content: 'no\n' } } },
+    { type: 'tool/ptc-dispatch', time: 8, data: { name: 'write', isError: false, arguments: { file_path: 'ptc.js', content: 'ptc\n' } } },
+    { type: 'tool/ptc-dispatch', time: 9, data: { name: 'edit', isError: false, arguments: { file_path: 'ptc.js', old_string: 'ptc', new_string: 'ptc2' } } },
+    { type: 'tool/ptc-dispatch', time: 10, data: { name: 'edit', isError: true, arguments: { file_path: 'ptc-failed.js', old_string: 'x', new_string: 'z' } } }
   ])
   const files = parsed.files
 
-  assert.deepEqual([...files.keys()], ['direct.js', 'nested.js', 'created.js'])
+  assert.deepEqual([...files.keys()], ['direct.js', 'nested.js', 'created.js', 'ptc.js'])
   assert.equal(files.get('nested.js').ops[0].kind, 'edit')
   assert.equal(files.get('nested.js').ops[0].turn, 7)
   assert.equal(files.get('created.js').ops[0].content, 'hello\n')
   assert.equal(files.has('failed.js'), false)
+  // renamed event shape: object arguments, one op per completed dispatch
+  assert.equal(files.get('ptc.js').ops.length, 2)
+  assert.equal(files.get('ptc.js').ops[0].content, 'ptc\n')
+  assert.equal(files.get('ptc.js').ops[1].kind, 'edit')
+  assert.equal(files.get('ptc.js').ops[1].turn, 7)
+  // the -start twin (no result) and errored dispatch must not create records
+  assert.equal(files.has('start-only.js'), false)
+  assert.equal(files.has('ptc-failed.js'), false)
   // The parser also reports the newest labeled turn: an in-flight turn with no
   // write/edit yet stays distinguishable from the last turn that had edits.
   assert.equal(parsed.activeTurn, 7)
@@ -278,4 +296,45 @@ test('isLoopbackRequest fence accepts loopback and rejects foreign hosts', () =>
   assert.equal(isLoopbackRequest({ headers: { host: '127.0.0.1:43120', origin: 'http://evil.example.com' } }), false)
   assert.equal(isLoopbackRequest({ headers: { host: '127.0.0.1:43120', origin: 'http://127.0.0.1:43120' } }), true)
   assert.equal(isLoopbackRequest({ headers: { host: '127.0.0.1:43120', 'sec-fetch-site': 'cross-site' } }), false)
+})
+
+/** Minimal loopback POST request + capturing response for channel RPC tests. */
+function rpcCall(channel, method, body) {
+  const payload = JSON.stringify({ type: 'client-request', rpcId: 't', method, payload: body })
+  const chunks = [Buffer.from(payload)]
+  const req = {
+    method: 'POST',
+    url: '/diff-review/' + method,
+    headers: { 'content-type': 'application/json', host: '127.0.0.1:43120' },
+    [Symbol.asyncIterator]() {
+      let i = 0
+      return { next: () => (i < chunks.length ? Promise.resolve({ value: chunks[i++], done: false }) : Promise.resolve({ value: undefined, done: true })) }
+    }
+  }
+  let out = ''
+  const res = { writeHead() {}, end(x) { out = String(x || '') } }
+  return channel.handler(req, res).then(() => JSON.parse(out))
+}
+
+test('host tags ops with the turn from snapshotEvents() (new DSH event surface)', async () => {
+  const { ctx, listeners, routes } = makeCtx({ withWebServer: true })
+  // New DSH: the session exposes snapshotEvents() instead of the live events
+  // array. With only the old `session.events` read, tagging silently fell
+  // back to turn 0 and every per-turn query came back empty.
+  const events = [{ type: 'turn/start', data: { turn: 4 } }]
+  ctx.agents.store.set('session-root', { agent: { session: { snapshotEvents: () => events } } })
+  assert.doesNotThrow(() => apply(ctx))
+  const channel = routes.find((r) => r.path === '/diff-review')
+  assert.ok(channel, 'channel attached')
+  const cb = listeners.get('tools/result')?.[0]
+  assert.equal(typeof cb, 'function')
+  cb(
+    { tool: 'write', name: 'write', input: { file_path: 'src/t.txt', content: 'x\n' }, agent: { id: 'session-root' } },
+    { value: { before: null, after: 'x\n' } }
+  )
+  const resp = await rpcCall(channel, 'turn', { session: 'session-root', turn: 4 })
+  assert.equal(resp.result.files.length, 1, 'op lands under turn 4')
+  assert.equal(resp.result.files[0].path, 'src/t.txt')
+  const resp0 = await rpcCall(channel, 'turn', { session: 'session-root', turn: 0 })
+  assert.equal(resp0.result.files.length, 0, 'op must not be tagged turn 0')
 })
