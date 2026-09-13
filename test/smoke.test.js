@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import vm from 'node:vm'
 import { apply, isLoopbackRequest, inject } from '../lib/index.js'
 
 /** Sandboxed profile dir per test, so flushes never touch real user data.
@@ -288,6 +289,487 @@ test('apply tolerates subagent owner chains via public API (isOwnedBy probe)', (
   for (const d of disposers) assert.doesNotThrow(() => d())
 })
 
+/** ctx whose ctx.agents behaves like the real registry: id -> live Agent, with
+ *  isOwnedBy() false and an empty owner field — the production shape once the
+ *  runtime owner chain is gone and only the durable session header is left. */
+function makeLineageCtx() {
+  const h = makeCtx({ withWebServer: true })
+  const live = new Map()
+  h.agents.get = (id) => live.get(id)
+  h.agents.list = () => [...live.values()]
+  h.agents.isOwnedBy = () => false
+  // A live registry entry: lookup (get/list) plus the internal store entry the
+  // turn scanner reads. No `owner` — runtime ownership is what is missing.
+  h.setLive = (agent) => {
+    live.set(agent.id, agent)
+    h.agents.store.set(agent.id, { id: agent.id, agent })
+  }
+  h.drop = (id) => {
+    live.delete(id)
+    h.agents.store.delete(id)
+  }
+  return h
+}
+
+/** Agent double: id + session header (+ optional snapshotEvents for turn tags). */
+function agentOf(id, header, events = []) {
+  return { id, session: { id, header: Object.assign({ id }, header), snapshotEvents: () => events } }
+}
+
+function recordWrite(h, agent, path, content) {
+  h.listeners.get('tools/result')[0](
+    { tool: 'write', name: 'write', input: { file_path: path, content }, agent },
+    { value: { before: null, after: content } }
+  )
+}
+
+function recordEdit(h, agent, path, oldString, newString) {
+  h.listeners.get('tools/result')[0](
+    { tool: 'edit', name: 'edit', input: { file_path: path, old_string: oldString, new_string: newString }, agent },
+    { value: { before: oldString, after: newString } }
+  )
+}
+
+/** Dispose the plugin (flushes the state synchronously) and read it back. */
+function flushedState(h) {
+  for (const d of h.disposers) d()
+  return JSON.parse(readFileSync(new URL('diff-review-state.json', h.ctx.baseUrl), 'utf8'))
+}
+
+test('subagent writes surface in the parent session view via durable parentSession lineage', async () => {
+  const h = makeLineageCtx()
+  h.setLive(agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 3 } }]))
+  const childId = '2b642fa0-45f2-47a5-a5d2-20a348058777'
+  const child = agentOf(childId, { origin: 'subagent', parentSession: 'session-root', delegationDepth: 1 })
+  // The child is NOT resolvable in the registry when its tool result is
+  // dispatched — the production failure: only the Agent in hand (exec.agent)
+  // carries the durable lineage, so isOwnedBy()/store can never find the parent.
+  apply(h.ctx)
+  recordWrite(h, child, 'src/sub.js', 'hello\n')
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  const summary = await rpcCall(channel, 'summary', { session: 'session-root' })
+  assert.equal(rpcValue(summary).files.length, 1, 'child write shows in the parent list')
+  assert.equal(rpcValue(summary).files[0].path, 'src/sub.js')
+  assert.equal(rpcValue(summary).files[0].ops, 1)
+  assert.equal(rpcValue(summary).files[0].writes, 1)
+
+  // The payload the review tab renders by default (turn scope, latest window)…
+  const latest = await rpcCall(channel, 'turn', { session: 'session-root', turn: -1 })
+  assert.equal(rpcValue(latest).files.length, 1)
+  assert.equal(rpcValue(latest).files[0].sections.length, 1)
+  assert.deepEqual(rpcValue(latest).files[0].sections[0].hunks.map((x) => x.text), ['hello', ''])
+  // …and when the parent's current turn is requested explicitly.
+  const turn = await rpcCall(channel, 'turn', { session: 'session-root', turn: 3 })
+  assert.equal(rpcValue(turn).files.length, 1, 'folded op carries the parent turn tag')
+
+  // Expandable file content (the file endpoint used when a file is opened).
+  const detail = await rpcCall(channel, 'file', { session: 'session-root', path: 'src/sub.js' })
+  assert.equal(rpcValue(detail).sections.length, 1)
+  assert.equal(rpcValue(detail).sections[0].hunks.length, 2)
+
+  // No stray bucket under the bare child session id.
+  assert.deepEqual(Object.keys(flushedState(h).sessions), ['session-root'])
+
+  // The finished child is gone from the registry: its own session view still
+  // resolves to the same parent bucket (learned lineage), not to an empty one.
+  h.drop(childId)
+  const viaDeadChild = await rpcCall(channel, 'summary', { session: childId })
+  assert.equal(rpcValue(viaDeadChild).files.length, 1, 'finished child view maps to the parent bucket')
+})
+
+test('parent + subagent edits of one file stay a single record (no double counting)', async () => {
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 4 } }])
+  h.setLive(root)
+  // Live child: the runtime-owner path and the lineage path must not both record.
+  const child = agentOf('7286378f-28e7-4fde-a36a-714d424511cd', { origin: 'subagent', parentSession: 'session-root' })
+  h.setLive(child)
+  apply(h.ctx)
+  recordEdit(h, root, 'src/dup.js', 'a', 'b')
+  recordEdit(h, child, 'src/dup.js', 'b', 'c')
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  const summary = await rpcCall(channel, 'summary', { session: 'session-root' })
+  assert.equal(rpcValue(summary).files.length, 1, 'one list entry for the file')
+  assert.equal(rpcValue(summary).files[0].ops, 2, 'each op counted exactly once')
+  assert.equal(rpcValue(summary).files[0].edits, 2)
+
+  const turn = await rpcCall(channel, 'turn', { session: 'session-root', turn: 4 })
+  assert.equal(rpcValue(turn).files.length, 1)
+  assert.deepEqual(rpcValue(turn).files[0].sections.map((s) => s.opIndex), [0, 1])
+
+  // A child view of a live child resolves to the same parent bucket.
+  const viaChild = await rpcCall(channel, 'summary', { session: child.id })
+  assert.equal(rpcValue(viaChild).files.length, 1, 'child view maps onto the root bucket')
+
+  const state = flushedState(h)
+  assert.deepEqual(Object.keys(state.sessions), ['session-root'])
+  assert.equal(state.sessions['session-root'].files['src/dup.js'].ops.length, 2)
+})
+
+test('nested subagent lineage folds into the top-level root (delegation depth 2)', async () => {
+  const h = makeLineageCtx()
+  h.setLive(agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 2 } }]))
+  h.setLive(agentOf('child-1', { origin: 'subagent', parentSession: 'session-root', delegationDepth: 1 }))
+  const grand = agentOf('grand-2', { origin: 'subagent', parentSession: 'child-1', delegationDepth: 2 })
+  apply(h.ctx)
+  recordWrite(h, grand, 'src/deep.js', 'deep\n')
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  const summary = await rpcCall(channel, 'summary', { session: 'session-root' })
+  assert.equal(rpcValue(summary).files.length, 1)
+  assert.equal(rpcValue(summary).files[0].path, 'src/deep.js')
+  const viaChild = await rpcCall(channel, 'summary', { session: 'child-1' })
+  assert.equal(rpcValue(viaChild).files.length, 1, 'the middle child view resolves to the root bucket')
+
+  assert.deepEqual(Object.keys(flushedState(h).sessions), ['session-root'])
+})
+
+test('negative: a forked session keeps its own bucket despite parentSession', async () => {
+  const h = makeLineageCtx()
+  h.setLive(agentOf('session-root', {}))
+  const forked = agentOf('session-fork', { parentSession: 'session-root' }) // no origin: user fork
+  h.setLive(forked)
+  apply(h.ctx)
+  recordWrite(h, forked, 'src/fork.js', 'f\n')
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  const own = await rpcCall(channel, 'summary', { session: 'session-fork' })
+  assert.equal(rpcValue(own).files.length, 1)
+  assert.equal(rpcValue(own).files[0].path, 'src/fork.js')
+  const parent = await rpcCall(channel, 'summary', { session: 'session-root' })
+  assert.equal(rpcValue(parent).files.length, 0, 'a fork must not leak into its source session')
+
+  assert.deepEqual(Object.keys(flushedState(h).sessions), ['session-fork'])
+})
+
+test('revert from a subagent session resolves its id to the root bucket', async () => {
+  const h = makeLineageCtx()
+  h.setLive(agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 6 } }]))
+  const sandboxDir = fileURLToPath(new URL('.', h.ctx.baseUrl))
+  const target = join(sandboxDir, 'revert-target.txt')
+  const child = agentOf('child-rev', { origin: 'subagent', parentSession: 'session-root', cwd: sandboxDir })
+  h.setLive(child)
+  apply(h.ctx)
+  recordEdit(h, child, target, 'a', 'b') // folded into the parent bucket
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  // A subagent session asks to revert with its OWN session id (the id its
+  // diff_review_revert tool call and its own review tab both pass).
+  const resp = await rpcCall(channel, 'revert', { session: child.id, path: target, op: null })
+  assert.equal(rpcValue(resp).ok, true, JSON.stringify(resp.result))
+  assert.equal(readFileSync(target, 'utf8'), 'a', 'restored to the pre-edit content')
+})
+
+test('negative: direct root calls and failed subagent calls behave unchanged', async () => {
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 5 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  const child = agentOf('child-9', { origin: 'subagent', parentSession: 'session-root' })
+  h.listeners.get('tools/result')[0](
+    { tool: 'write', name: 'write', input: { file_path: 'src/fail.js', content: 'x' }, agent: child },
+    { isError: true, error: 'boom' }
+  )
+  recordWrite(h, root, 'root.js', 'r\n')
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  const summary = await rpcCall(channel, 'summary', { session: 'session-root' })
+  assert.deepEqual(rpcValue(summary).files.map((f) => f.path), ['root.js'])
+  const turn = await rpcCall(channel, 'turn', { session: 'session-root', turn: 5 })
+  assert.equal(rpcValue(turn).files.length, 1)
+  assert.equal(rpcValue(turn).files[0].path, 'root.js')
+})
+
+test('host summary adoption replaces the local list wholesale (replace-not-merge)', () => {
+  const adoptHostSummary = clientFunction('adoptHostSummary')
+  const local = [{ path: 'local.js', ops: 1 }]
+  // Non-empty host payload wins entirely — the local entry is NOT merged in,
+  // so a file touched by both the parent and a subagent is counted once.
+  const host = { files: [{ path: 'sub.js', ops: 2 }], latestTurn: 7 }
+  const adopted = adoptHostSummary(host, local, 3)
+  assert.equal(adopted.fromHost, true)
+  assert.equal(adopted.files, host.files, 'host files adopted by reference (no merge)')
+  assert.equal(adopted.latestTurn, 7, 'host latestTurn wins')
+  assert.equal(adopted.files.some((f) => f.path === 'local.js'), false, 'no local entry survives')
+  // A host payload with a numeric-but-0 latestTurn still adopts the files.
+  const zero = adoptHostSummary({ files: [{ path: 'x' }], latestTurn: 0 }, local, 5)
+  assert.equal(zero.fromHost, true)
+  assert.equal(zero.latestTurn, 0)
+})
+
+test('host summary fallback: empty/failed host keeps the local list byte-for-byte', () => {
+  const adoptHostSummary = clientFunction('adoptHostSummary')
+  const local = [{ path: 'local.js', ops: 1 }]
+  for (const host of [null, undefined, {}, { files: [] }, { files: null }, { files: 'nope' }]) {
+    const adopted = adoptHostSummary(host, local, 3)
+    assert.equal(adopted.fromHost, false, `no host adoption for ${JSON.stringify(host)}`)
+    assert.equal(adopted.files, local, 'the local list object is kept as-is')
+    assert.equal(adopted.latestTurn, 3, 'the local latestTurn is kept as-is')
+  }
+})
+
+test('badge/pill: host latest-activity window wins, local window otherwise', () => {
+  const hostWindowItems = clientFunction('hostWindowItems')
+  const hostItems = [{ path: 'sub.js', ops: 1 }]
+  // Host window has files and is not older than the active turn -> its count.
+  assert.deepEqual(hostWindowItems({ turn: 4, files: hostItems }, 4), hostItems)
+  assert.deepEqual(hostWindowItems({ turn: 4, files: hostItems }, 0), hostItems, 'no active turn: trust the host window')
+  // Host window is the PREVIOUS turn's payload while a newer turn runs: do not
+  // resurrect it (the local fixed behavior must stay).
+  assert.equal(hostWindowItems({ turn: 4, files: hostItems }, 5), null)
+  // No host data -> null, so the caller falls back to the local window.
+  assert.equal(hostWindowItems(null, 4), null)
+  assert.equal(hostWindowItems({ turn: 4, files: [] }, 4), null)
+})
+
+test("'all' expansion needs the host file endpoint only without a local record", () => {
+  const needHostDetail = clientFunction('needHostDetail')
+  // Host-only entry (subagent file): no sections on the summary item and no
+  // local record -> the hunks must come from the host file endpoint.
+  assert.equal(needHostDetail('all', { path: 'sub.js' }, undefined), true)
+  // Local record exists -> keep the current path.
+  assert.equal(needHostDetail('all', { path: 'sub.js' }, { path: 'sub.js', ops: [] }), false)
+  // Payload already carries sections (turn payload) -> nothing to fetch.
+  assert.equal(needHostDetail('all', { path: 'sub.js', sections: [{ hunks: [] }] }, undefined), false)
+  // Turn scope is unchanged.
+  assert.equal(needHostDetail('turn', { path: 'sub.js' }, undefined), false)
+  assert.equal(needHostDetail('all', null, undefined), false)
+})
+
+test('client surfaces and the host aggregate agree on a parent+subagent file (no double count)', async () => {
+  // End-to-end shape: the host records the parent op and the subagent op for
+  // the SAME file into one root bucket (t3); the client must count that once
+  // on every surface it drives.
+  const adoptHostSummary = clientFunction('adoptHostSummary')
+  const hostWindowItems = clientFunction('hostWindowItems')
+  const needHostDetail = clientFunction('needHostDetail')
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 4 } }])
+  h.setLive(root)
+  const child = agentOf('child-1', { origin: 'subagent', parentSession: 'session-root' })
+  h.setLive(child)
+  apply(h.ctx)
+  recordEdit(h, root, 'src/dup.js', 'a', 'b')
+  recordEdit(h, child, 'src/dup.js', 'b', 'c')
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  const hostSummary = rpcValue(await rpcCall(channel, 'summary', { session: 'session-root' }))
+  const hostTurn = rpcValue(await rpcCall(channel, 'turn', { session: 'session-root', turn: -1 }))
+  assert.equal(hostSummary.files.length, 1, 'host aggregates both ops into one entry')
+  assert.equal(hostSummary.files[0].ops, 2)
+  assert.equal(hostTurn.files.length, 1)
+  assert.equal(hostTurn.files[0].ops, 2)
+
+  // The parent's own transcript would only show ONE op (its own edit): that is
+  // the local fallback the client had before this change.
+  const localFiles = [{ path: 'src/dup.js', name: 'dup.js', ops: 1, writes: 0, edits: 1, added: 1, removed: 1, lastTime: 1 }]
+  const adopted = adoptHostSummary(hostSummary, localFiles, 4)
+  assert.equal(adopted.fromHost, true)
+  assert.equal(adopted.files.length, 1)
+  assert.equal(adopted.files[0].ops, 2, 'the adopted list carries the host count, once')
+  assert.equal(adopted.files.some((f) => f.ops === 1), false, 'the local (partial) entry is not merged in')
+
+  const hostItems = hostWindowItems({ turn: hostTurn.turn, files: hostTurn.files }, 4)
+  assert.equal(hostItems.length, 1)
+  assert.equal(hostItems[0].ops, 2, 'badge/pill window counts the same op set')
+  // All-scope expansion: the file has no local record -> host file endpoint.
+  assert.equal(needHostDetail('all', adopted.files[0], undefined), true)
+  const detail = rpcValue(await rpcCall(channel, 'file', { session: 'session-root', path: 'src/dup.js' }))
+  assert.equal(detail.sections.length, 2, 'expanding the host-only entry yields both hunks')
+})
+
+/** Minimal React double with per-component hook slots, enough to run the real
+ *  client bundle in a VM: function components render to plain element trees. */
+function makeReactDouble() {
+  const hooks = new Map()
+  let comp = null
+  let idx = 0
+  const slot = (fn) => {
+    let s = hooks.get(fn)
+    if (!s) { s = { states: [], deps: [] }; hooks.set(fn, s) }
+    return s
+  }
+  return {
+    createElement: (type, props, ...children) => ({ type, props: props || {}, children: children.flat().filter((c) => c != null) }),
+    useState: (init) => {
+      const s = slot(comp)
+      const i = idx++
+      if (!(i in s.states)) s.states[i] = typeof init === 'function' ? init() : init
+      // The setter must write back into the slot: the live store notifies
+      // subscribers via setV, and the next render reads the fresh value.
+      const setV = (v) => { s.states[i] = typeof v === 'function' ? v(s.states[i]) : v }
+      return [s.states[i], setV]
+    },
+    useEffect: (fn, deps) => {
+      const s = slot(comp)
+      const i = idx++
+      const prev = s.deps[i]
+      const changed = !prev || !deps || deps.length !== prev.length || deps.some((d, k) => !Object.is(d, prev[k]))
+      s.deps[i] = deps ? [...deps] : undefined
+      if (changed) fn()
+    },
+    useRef: (v) => {
+      const s = slot(comp)
+      const i = idx++
+      if (!('ref' + i in s.states)) s.states['ref' + i] = { current: v }
+      return s.states['ref' + i]
+    },
+    useMemo: (fn) => fn(),
+    useCallback: (fn) => fn,
+    Fragment: 'Fragment',
+    beginRender(type) { comp = type; idx = 0 },
+    endRender(prev) { comp = prev }
+  }
+}
+
+/** Load the REAL shipped client bundle and boot its plugin wiring against a
+ *  stub connection, so tests can drive rebuildReview -> store -> the actual
+ *  TabLabel / ReviewView components instead of re-implementing them. */
+function loadRealClient(rpc) {
+  const src = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  const React = makeReactDouble()
+  let exports = null
+  const sandbox = {
+    console,
+    setTimeout, clearTimeout,
+    matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    MutationObserver: class { observe() {} disconnect() {} },
+    AbortController, URL, RegExp,
+    document: {
+      createElement: () => ({ textContent: '', remove() {} }),
+      head: { appendChild() {} },
+      body: { addEventListener() {}, removeEventListener() {} },
+      querySelectorAll: () => [],
+      addEventListener() {}, removeEventListener() {}
+    },
+    requestAnimationFrame: (fn) => fn()
+  }
+  sandbox.globalThis = sandbox
+  sandbox.window = sandbox
+  sandbox.__ModuleLoader__ = {
+    load(mod) {
+      exports = mod.factory((name) => {
+        if (name === 'react') return React
+        throw new Error('unexpected client require: ' + name)
+      })
+    }
+  }
+  vm.createContext(sandbox)
+  vm.runInContext(src, sandbox)
+
+  const calls = []
+  const registered = []
+  const conn = { rpc: { call: (target, endpoint, payload) => { calls.push({ endpoint, payload }); return rpc(endpoint, payload) } } }
+  exports.apply({
+    get: (n) => (n === 'connection' ? conn : undefined),
+    effect: (fn) => { const d = fn(); if (typeof d === 'function') d(); return () => {} },
+    slots: { inject: (n, cb) => { cb() }, register: (def, Comp) => { registered.push({ def, Comp }); return () => {} } },
+    sessions: { list: { getSnapshot: () => ({ byId: {} }) } },
+    workspaces: {}
+  })
+  const slotComp = (name, id) => registered.find((r) => r.def.name === name && (id === undefined || r.def.id === id))
+  const render = (el) => {
+    if (!el || typeof el !== 'object' || typeof el.type !== 'function') return el
+    const prev = null
+    React.beginRender(el.type)
+    const out = el.type(el.props)
+    React.endRender(prev)
+    return render(out)
+  }
+  const collect = (tree, cls, out = []) => {
+    if (!tree || typeof tree !== 'object') return out
+    if (tree.props && typeof tree.props.className === 'string' && tree.props.className.split(' ').includes(cls)) out.push(tree)
+    for (const ch of tree.children || []) collect(ch, cls, out)
+    return out
+  }
+  return { calls, registered, slotComp, render, collect }
+}
+
+test('client bundle wiring: host data drives badge + list, empty host falls back to the local parse', async () => {
+  const LOCAL_EVENTS = [
+    { seq: 1, type: 'turn/start', time: 1, data: { turn: 7 } },
+    { seq: 2, type: 'tool/call', time: 2, data: { callId: 'c1', name: 'edit', arguments: { file_path: 'local-only.js', old_string: 'a', new_string: 'b' } } },
+    { seq: 3, type: 'tool/result', time: 3, data: { callId: 'c1', message: {} } }
+  ]
+  const sub = (n) => ({ path: `sub-${n}.js`, name: `sub-${n}.js`, ops: 2, writes: 1, edits: 1, added: 5, removed: 1, lastTime: 9 + n })
+  const settle = () => new Promise((r) => setTimeout(r, 60))
+  const boot = async (hostFiles, turnFiles) => {
+    const c = loadRealClient(async (endpoint, payload) => {
+      if (endpoint === 'editors') return { editors: [] }
+      if (endpoint === 'summary') return { files: hostFiles, latestTurn: 7 }
+      if (endpoint === 'turn') return { turn: 7, files: turnFiles }
+      if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', projections: { asOfSeq: 3 } }] } } }
+      if (endpoint === 'session/page') return { result: { ok: true, value: { records: LOCAL_EVENTS.map((e) => ({ event: e })) } } }
+      return {}
+    })
+    c.render(c.slotComp('conversation.session.header.actions').Comp({ sessionId: 'session-root' }))
+    await settle()
+    const view = c.slotComp('conversation.view', 'review')
+    // render -> settle passes: the stub runs effects during render and the
+    // async host loads resolve between passes.
+    let tree = null
+    for (let i = 0; i < 5; i++) {
+      tree = c.render(view.Comp({ sessionId: 'session-root' }))
+      await settle()
+    }
+    const badge = c.collect(c.render(view.def.label()), 'drv-tab-badge')[0]
+    return { c, tree, badge: badge && badge.children[0] }
+  }
+
+  // Host has 3 subagent files while the parent transcript has only its own op.
+  const host = await boot([sub(1), sub(2), sub(3)], [sub(1), sub(2), sub(3)])
+  assert.equal(host.badge, '3', 'badge counts the host-visible files')
+  assert.deepEqual(host.c.collect(host.tree, 'cdx-fl-item').map((r) => r.props.title), ['sub-1.js', 'sub-2.js', 'sub-3.js'], 'list shows the host files')
+  assert.equal(host.c.calls.some((x) => x.endpoint === 'summary'), true, 'the existing summary endpoint is used')
+
+  // Host empty -> the local parse only (behavior identical to before).
+  const local = await boot([], [])
+  assert.equal(local.badge, '1', 'badge falls back to the local parse')
+  assert.deepEqual(local.c.collect(local.tree, 'cdx-fl-item').map((r) => r.props.title), ['local-only.js'], 'list is the local parse')
+})
+
+test("client 'all' scope: expanding a host-only file goes through the file endpoint", async () => {
+  const sub = { path: 'sub-only.js', name: 'sub-only.js', ops: 2, writes: 1, edits: 1, added: 5, removed: 1, lastTime: 9 }
+  // Host summary has the subagent file; the host turn window and the parent
+  // transcript have nothing, so only the 'all' list can show it.
+  const c = loadRealClient(async (endpoint, payload) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [sub], latestTurn: 7 }
+    if (endpoint === 'turn') return { turn: 7, files: [] }
+    if (endpoint === 'file') return { path: payload.path, sections: [{ kind: 'write', at: 1, hunks: [{ type: 'add', a: null, b: 1, text: 'from-host' }] }] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', projections: { asOfSeq: 3 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  })
+  c.render(c.slotComp('conversation.session.header.actions').Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+  const view = c.slotComp('conversation.view', 'review')
+  let tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+  tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  const select = c.collect(tree, 'cdx-turn-select')[0]
+  assert.ok(select, 'turn/scope switcher rendered')
+  select.props.onChange({ target: { value: 'all' } }) // "全部修改"
+  tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  const rows = c.collect(tree, 'cdx-fl-item')
+  assert.deepEqual(rows.map((r) => r.props.title), ['sub-only.js'], 'the host-only file is listed in the all scope')
+  assert.equal(c.calls.some((x) => x.endpoint === 'file'), false, 'no detail fetched before expanding')
+
+  rows[0].props.onClick() // expand the host-only entry
+  await new Promise((r) => setTimeout(r, 40))
+  const fileCalls = c.calls.filter((x) => x.endpoint === 'file')
+  // JSON compare: the payload objects come from the VM realm, so strict
+  // prototype-sensitive deepEqual would not match host-realm objects.
+  assert.equal(JSON.stringify(fileCalls.map((x) => x.payload)), JSON.stringify([{ session: 'session-root', path: 'sub-only.js' }]), 'expansion fetched the hunks from the file endpoint')
+  tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  const sections = c.collect(tree, 'cdx-sec')
+  assert.equal(sections.length, 1, 'the fetched section renders')
+  assert.equal(c.collect(sections[0], 'cdx-line').length >= 0, true)
+})
+
 test('isLoopbackRequest fence accepts loopback and rejects foreign hosts', () => {
   assert.equal(isLoopbackRequest({ headers: { host: '127.0.0.1:43120' } }), true)
   assert.equal(isLoopbackRequest({ headers: { host: 'localhost:3080' } }), true)
@@ -316,6 +798,28 @@ function rpcCall(channel, method, body) {
   return channel.handler(req, res).then(() => JSON.parse(out))
 }
 
+/** Mirror of the official Web transport's parseConnectionResponse: it THROWS on
+ *  anything other than { ok: true, value } | { ok: false, error: { code,
+ *  message, details } }. A bare payload therefore makes EVERY client call fail
+ *  inside the transport, before the plugin can see it — the review view then
+ *  silently falls back to local history and never shows subagent edits.
+ *  Asserting host replies through this helper keeps that contract pinned. */
+function rpcValue(resp) {
+  assert.ok(resp && typeof resp === 'object' && !Array.isArray(resp), 'reply is a record')
+  assert.equal(resp.type, 'server-response', 'reply is a server-response')
+  assert.equal(typeof resp.rpcId, 'string', 'reply echoes rpcId')
+  const result = resp.result
+  assert.ok(result && typeof result === 'object' && !Array.isArray(result), 'result is a record')
+  if (result.ok === true) return result.value
+  assert.equal(result.ok, false, 'result.ok is true|false')
+  const error = result.error
+  assert.ok(error && typeof error === 'object' && !Array.isArray(error), 'error is a record')
+  assert.equal(typeof error.code, 'string', 'error.code is a string')
+  assert.equal(typeof error.message, 'string', 'error.message is a string')
+  assert.ok(error.details && typeof error.details === 'object' && !Array.isArray(error.details), 'error.details is a record')
+  return { ok: false, error }
+}
+
 test('host tags ops with the turn from snapshotEvents() (new DSH event surface)', async () => {
   const { ctx, listeners, routes } = makeCtx({ withWebServer: true })
   // New DSH: the session exposes snapshotEvents() instead of the live events
@@ -333,8 +837,44 @@ test('host tags ops with the turn from snapshotEvents() (new DSH event surface)'
     { value: { before: null, after: 'x\n' } }
   )
   const resp = await rpcCall(channel, 'turn', { session: 'session-root', turn: 4 })
-  assert.equal(resp.result.files.length, 1, 'op lands under turn 4')
-  assert.equal(resp.result.files[0].path, 'src/t.txt')
+  assert.equal(rpcValue(resp).files.length, 1, 'op lands under turn 4')
+  assert.equal(rpcValue(resp).files[0].path, 'src/t.txt')
   const resp0 = await rpcCall(channel, 'turn', { session: 'session-root', turn: 0 })
-  assert.equal(resp0.result.files.length, 0, 'op must not be tagged turn 0')
+  assert.equal(rpcValue(resp0).files.length, 0, 'op must not be tagged turn 0')
+})
+
+test('client unwraps the official RPC envelope and tolerates bare payloads', () => {
+  const hostValueOf = clientFunction('hostValueOf')
+  // Official Web transport face: { ok: true, value }
+  assert.deepEqual(hostValueOf({ ok: true, value: { files: ['a'] } }), { files: ['a'] })
+  assert.equal(hostValueOf({ ok: true, value: null }), null)
+  // Desktop bridge / older host face: the bare payload reaches the plugin.
+  assert.deepEqual(hostValueOf({ files: ['a'], latestTurn: 3 }), { files: ['a'], latestTurn: 3 })
+  assert.deepEqual(hostValueOf({ editors: [] }), { editors: [] })
+  // Payload-level ok flags are business results, NOT envelopes: `error` is a
+  // string there, so they must pass through untouched (open-with-editor,
+  // revert). Promoting them would misreport a business refusal as a transport
+  // failure and send the caller down the wrong fallback.
+  assert.deepEqual(hostValueOf({ ok: true }), { ok: true })
+  assert.deepEqual(hostValueOf({ ok: false, error: '编辑器未安装' }), { ok: false, error: '编辑器未安装' })
+  // Transport-level failure carries the contract-shaped error record.
+  assert.throws(() => hostValueOf({ ok: false, error: { code: 'x', message: 'boom', details: {} } }), /boom/)
+})
+
+test('tab badge keeps the host latest-activity window across a fresh turn', () => {
+  // The running pill drops a host window older than the active turn (its
+  // semantic is "this round"); the tab badge must NOT — it counts pending
+  // review items, and subagent changes exist only in the host. Regression:
+  // the badge vanished (read 0) whenever the user opened a new turn.
+  const badgeHostItems = clientFunction('badgeHostItems')
+  const hostWindowItems = clientFunction('hostWindowItems')
+  const window33 = { turn: 33, files: [{ path: 'a.js' }, { path: 'b.js' }, { path: 'c.js' }] }
+  // Badge face: keeps the window even though the active turn (34) is newer.
+  assert.equal(badgeHostItems(window33).length, 3, 'badge shows the latest activity in a fresh turn')
+  assert.equal(badgeHostItems({ turn: 34, files: [{ path: 'd.js' }] }).length, 1, 'badge follows new activity')
+  assert.equal(badgeHostItems(null), null, 'no host data -> local fallback')
+  assert.equal(badgeHostItems({ turn: 33, files: [] }), null, 'empty window -> local fallback')
+  // Pill face: unchanged — the stale window is still suppressed there.
+  assert.equal(hostWindowItems(window33, 34), null, 'pill still follows the in-flight turn')
+  assert.equal(hostWindowItems(window33, 33).length, 3, 'pill shows the current turn window')
 })
