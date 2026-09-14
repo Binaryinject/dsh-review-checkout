@@ -1,10 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, realpathSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, realpathSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
 import { apply, isLoopbackRequest, inject } from '../lib/index.js'
@@ -484,21 +484,33 @@ test('negative: direct root calls and failed subagent calls behave unchanged', a
   assert.equal(rpcValue(turn).files[0].path, 'root.js')
 })
 
-test('host summary adoption replaces the local list wholesale (replace-not-merge)', () => {
+test('host summary adoption merges per path with the host winning (no double count)', () => {
   const adoptHostSummary = clientFunction('adoptHostSummary')
-  const local = [{ path: 'local.js', ops: 1 }]
-  // Non-empty host payload wins entirely — the local entry is NOT merged in,
-  // so a file touched by both the parent and a subagent is counted once.
-  const host = { files: [{ path: 'sub.js', ops: 2 }], latestTurn: 7 }
+  const local = [{ path: 'local.js', ops: 1 }, { path: 'both.js', ops: 1, lastTime: 1 }]
+  // The host is authoritative for every path it knows, so `both.js` appears
+  // exactly once with the host's op count — and `local.js`, which the host never
+  // saw (plugin loaded mid-session / cleared state), is KEPT instead of being
+  // dropped by a wholesale replace.
+  const host = { files: [{ path: 'sub.js', ops: 2 }, { path: 'both.js', ops: 3, lastTime: 9 }], latestTurn: 7 }
   const adopted = adoptHostSummary(host, local, 3)
   assert.equal(adopted.fromHost, true)
-  assert.equal(adopted.files, host.files, 'host files adopted by reference (no merge)')
-  assert.equal(adopted.latestTurn, 7, 'host latestTurn wins')
-  assert.equal(adopted.files.some((f) => f.path === 'local.js'), false, 'no local entry survives')
+  assert.deepEqual(adopted.files.map((f) => f.path).sort(), ['both.js', 'local.js', 'sub.js'])
+  assert.equal(adopted.files.filter((f) => f.path === 'both.js').length, 1, 'one entry per path')
+  assert.equal(adopted.files.find((f) => f.path === 'both.js').ops, 3, 'the host entry wins for a shared path')
+  assert.equal(adopted.files.find((f) => f.path === 'sub.js').ops, 2)
+  assert.equal(adopted.files.find((f) => f.path === 'local.js').ops, 1, 'a transcript-only path survives')
+  assert.equal(adopted.latestTurn, 7, 'host latestTurn wins when it is the newest')
+  // A local-only file can carry the newest turn: the window cursor must not
+  // move backwards because the host list is older.
+  assert.equal(adoptHostSummary(host, local, 11).latestTurn, 11, 'the higher turn wins')
   // A host payload with a numeric-but-0 latestTurn still adopts the files.
   const zero = adoptHostSummary({ files: [{ path: 'x' }], latestTurn: 0 }, local, 5)
   assert.equal(zero.fromHost, true)
-  assert.equal(zero.latestTurn, 0)
+  assert.equal(zero.latestTurn, 5)
+  // Entries without a path cannot be keyed: they are dropped from the host side
+  // (they could never be rendered or expanded anyway).
+  const junk = adoptHostSummary({ files: [{ ops: 1 }, { path: 'ok.js' }], latestTurn: 1 }, [], 0)
+  assert.deepEqual(junk.files.map((f) => f.path), ['ok.js'])
 })
 
 test('host summary fallback: empty/failed host keeps the local list byte-for-byte', () => {
@@ -526,18 +538,24 @@ test('badge/pill: host latest-activity window wins, local window otherwise', () 
   assert.equal(hostWindowItems({ turn: 4, files: [] }, 4), null)
 })
 
-test("'all' expansion needs the host file endpoint only without a local record", () => {
+test("'all' expansion uses the host file endpoint whenever the list is host-adopted", () => {
   const needHostDetail = clientFunction('needHostDetail')
+  const localRec = { path: 'sub.js', ops: [{}] }
   // Host-only entry (subagent file): no sections on the summary item and no
-  // local record -> the hunks must come from the host file endpoint.
-  assert.equal(needHostDetail('all', { path: 'sub.js' }, undefined), true)
-  // Local record exists -> keep the current path.
-  assert.equal(needHostDetail('all', { path: 'sub.js' }, { path: 'sub.js', ops: [] }), false)
+  // local record -> the hunks come from the host file endpoint.
+  assert.equal(needHostDetail('all', { path: 'sub.js' }, undefined, false), true)
+  // Host-adopted list, but the parent ALSO edited this file (local record
+  // exists): the row counts are the host's, so the body must be too — otherwise
+  // the subagent's hunk is invisible behind an "编辑×2" header.
+  assert.equal(needHostDetail('all', { path: 'sub.js' }, localRec, true), true)
+  // Transcript-sourced list (Desktop / older host): the local record is the
+  // only source, so nothing is fetched.
+  assert.equal(needHostDetail('all', { path: 'sub.js' }, localRec, false), false)
   // Payload already carries sections (turn payload) -> nothing to fetch.
-  assert.equal(needHostDetail('all', { path: 'sub.js', sections: [{ hunks: [] }] }, undefined), false)
+  assert.equal(needHostDetail('all', { path: 'sub.js', sections: [{ hunks: [] }] }, undefined, true), false)
   // Turn scope is unchanged.
-  assert.equal(needHostDetail('turn', { path: 'sub.js' }, undefined), false)
-  assert.equal(needHostDetail('all', null, undefined), false)
+  assert.equal(needHostDetail('turn', { path: 'sub.js' }, undefined, true), false)
+  assert.equal(needHostDetail('all', null, undefined, true), false)
 })
 
 test('client surfaces and the host aggregate agree on a parent+subagent file (no double count)', async () => {
@@ -694,16 +712,24 @@ test('client bundle wiring: host data drives badge + list, empty host falls back
   const LOCAL_EVENTS = [
     { seq: 1, type: 'turn/start', time: 1, data: { turn: 7 } },
     { seq: 2, type: 'tool/call', time: 2, data: { callId: 'c1', name: 'edit', arguments: { file_path: 'local-only.js', old_string: 'a', new_string: 'b' } } },
-    { seq: 3, type: 'tool/result', time: 3, data: { callId: 'c1', message: {} } }
+    { seq: 3, type: 'tool/result', time: 3, data: { callId: 'c1', message: {} } },
+    // The parent also edited sub-1.js; the host aggregates that op with the
+    // subagent's into one entry (2 ops) — the client must show ONE row.
+    { seq: 4, type: 'tool/call', time: 4, data: { callId: 'c2', name: 'edit', arguments: { file_path: 'sub-1.js', old_string: 'a', new_string: 'b' } } },
+    { seq: 5, type: 'tool/result', time: 5, data: { callId: 'c2', message: {} } }
   ]
   const sub = (n) => ({ path: `sub-${n}.js`, name: `sub-${n}.js`, ops: 2, writes: 1, edits: 1, added: 5, removed: 1, lastTime: 9 + n })
   const settle = () => new Promise((r) => setTimeout(r, 60))
-  const boot = async (hostFiles, turnFiles) => {
+  // `envelope` = the official Web transport shape: rpc.call resolves with the
+  // parsed RPC result { ok: true, value } (client.js unwraps it). Without it the
+  // stub returns a bare payload, i.e. the Desktop bridge / older host face.
+  const boot = async (hostFiles, turnFiles, envelope) => {
+    const wrap = (v) => (envelope ? { ok: true, value: v } : v)
     const c = loadRealClient(async (endpoint, payload) => {
-      if (endpoint === 'editors') return { editors: [] }
-      if (endpoint === 'summary') return { files: hostFiles, latestTurn: 7 }
-      if (endpoint === 'turn') return { turn: 7, files: turnFiles }
-      if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', projections: { asOfSeq: 3 } }] } } }
+      if (endpoint === 'editors') return wrap({ editors: [] })
+      if (endpoint === 'summary') return wrap({ files: hostFiles, latestTurn: 7 })
+      if (endpoint === 'turn') return wrap({ turn: 7, files: turnFiles })
+      if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', projections: { asOfSeq: 5 } }] } } }
       if (endpoint === 'session/page') return { result: { ok: true, value: { records: LOCAL_EVENTS.map((e) => ({ event: e })) } } }
       return {}
     })
@@ -718,19 +744,96 @@ test('client bundle wiring: host data drives badge + list, empty host falls back
       await settle()
     }
     const badge = c.collect(c.render(view.def.label()), 'drv-tab-badge')[0]
-    return { c, tree, badge: badge && badge.children[0] }
+    // The session-wide list lives in the 'all' ("全部修改") scope; the default
+    // turn scope shows only the requested turn's payload.
+    const select = c.collect(tree, 'cdx-turn-select')[0]
+    let allTitles = []
+    if (select) {
+      select.props.onChange({ target: { value: 'all' } })
+      allTitles = c.collect(c.render(view.Comp({ sessionId: 'session-root' })), 'cdx-fl-item').map((r) => r.props.title)
+    }
+    return { c, tree, badge: badge && badge.children[0], allTitles }
   }
 
-  // Host has 3 subagent files while the parent transcript has only its own op.
+  // 3 host files, one of which the parent also touched, plus a transcript-only
+  // path the host never saw. Union per path: 4 rows, never a duplicate row, and
+  // the badge is the same number the panel shows.
   const host = await boot([sub(1), sub(2), sub(3)], [sub(1), sub(2), sub(3)])
-  assert.equal(host.badge, '3', 'badge counts the host-visible files')
-  assert.deepEqual(host.c.collect(host.tree, 'cdx-fl-item').map((r) => r.props.title), ['sub-1.js', 'sub-2.js', 'sub-3.js'], 'list shows the host files')
+  assert.deepEqual(host.c.collect(host.tree, 'cdx-fl-item').map((r) => r.props.title), ['sub-1.js', 'sub-2.js', 'sub-3.js'], 'turn scope shows the turn payload')
+  assert.equal(host.allTitles.filter((t) => t === 'sub-1.js').length, 1, 'a parent+subagent file is one row, not two')
+  assert.deepEqual(host.allTitles.slice().sort(), ['local-only.js', 'sub-1.js', 'sub-2.js', 'sub-3.js'], 'host rows win per path; a transcript-only path is kept')
+  assert.equal(host.badge, '4', 'badge === list length (the tab and the panel agree)')
   assert.equal(host.c.calls.some((x) => x.endpoint === 'summary'), true, 'the existing summary endpoint is used')
 
-  // Host empty -> the local parse only (behavior identical to before).
+  // Same expectations through the OFFICIAL Web transport face, where rpc.call
+  // resolves with { ok: true, value } — the production shape that the original
+  // bare-payload bug hid. This is the envelope integration the fix relies on.
+  const enveloped = await boot([sub(1), sub(2), sub(3)], [sub(1), sub(2), sub(3)], true)
+  assert.equal(enveloped.badge, host.badge, 'badge identical when the transport returns the official envelope')
+  assert.deepEqual(enveloped.allTitles.slice().sort(), host.allTitles.slice().sort(), 'list identical with the official envelope')
+
+  // Host empty -> the local parse only (behavior identical to before): the
+  // transcript's two files are both in the latest turn, so the badge is 2.
   const local = await boot([], [])
-  assert.equal(local.badge, '1', 'badge falls back to the local parse')
-  assert.deepEqual(local.c.collect(local.tree, 'cdx-fl-item').map((r) => r.props.title), ['local-only.js'], 'list is the local parse')
+  assert.equal(local.badge, '2', 'badge falls back to the local window')
+  assert.deepEqual(local.allTitles.slice().sort(), ['local-only.js', 'sub-1.js'], 'list is the local parse')
+})
+
+test("client 'all' scope expands a parent+subagent file from the host (both hunks)", async () => {
+  // Regression: the file is in BOTH the transcript (the parent's own op) and the
+  // host aggregate (parent + subagent = 2 ops). The row header shows the host
+  // count, so the body must come from the host too — the transcript alone would
+  // render just one hunk behind an "编辑×2" header.
+  const dup = { path: 'src/dup.js', name: 'dup.js', ops: 2, writes: 0, edits: 2, added: 2, removed: 2, lastTime: 9 }
+  const LOCAL = [
+    { seq: 1, type: 'turn/start', time: 1, data: { turn: 7 } },
+    { seq: 2, type: 'tool/call', time: 2, data: { callId: 'c1', name: 'edit', arguments: { file_path: 'src/dup.js', old_string: 'a', new_string: 'b' } } },
+    { seq: 3, type: 'tool/result', time: 3, data: { callId: 'c1', message: {} } }
+  ]
+  const c = loadRealClient(async (endpoint, payload) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [dup], latestTurn: 7 }
+    if (endpoint === 'turn') return { turn: 7, files: [dup] }
+    if (endpoint === 'file') {
+      if (payload.path !== 'src/dup.js') return { path: payload.path, sections: [] }
+      return { path: payload.path, sections: [
+        { kind: 'edit', at: 1, hunks: [{ type: 'add', a: null, b: 1, text: 'parent' }] },
+        { kind: 'edit', at: 2, hunks: [{ type: 'add', a: null, b: 2, text: 'subagent' }] }
+      ] }
+    }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', projections: { asOfSeq: 3 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: LOCAL.map((e) => ({ event: e })) } } }
+    return {}
+  })
+  c.render(c.slotComp('conversation.session.header.actions').Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+  const view = c.slotComp('conversation.view', 'review')
+  let tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+  tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  const select = c.collect(tree, 'cdx-turn-select')[0]
+  assert.ok(select, 'turn/scope switcher rendered')
+  select.props.onChange({ target: { value: 'all' } }) // "全部修改"
+  tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  const rows = c.collect(tree, 'cdx-fl-item')
+  assert.deepEqual(rows.map((r) => r.props.title), ['src/dup.js'], 'the host entry is listed once')
+
+  rows[0].props.onClick() // select the file in the detail pane
+  await new Promise((r) => setTimeout(r, 40))
+  assert.equal(c.calls.some((x) => x.endpoint === 'file' && x.payload.path === 'src/dup.js'), true, 'the host file endpoint was used despite the local record')
+  tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  assert.equal(c.collect(tree, 'cdx-sec').length, 2, 'both the parent hunk and the subagent hunk render')
+  // CodexLine is a nested component (not expanded by the render double), so the
+  // hunk payloads are read off the elements themselves.
+  const hunks = (node, out = []) => {
+    if (!node || typeof node !== 'object') return out
+    if (node.props && node.props.h && typeof node.props.h.text === 'string') out.push(node.props.h.text)
+    for (const ch of node.children || []) hunks(ch, out)
+    return out
+  }
+  const texts = hunks(tree)
+  assert.equal(texts.includes('subagent'), true, 'the subagent hunk is visible')
+  assert.equal(texts.includes('parent'), true, 'the parent hunk is visible')
 })
 
 test("client 'all' scope: expanding a host-only file goes through the file endpoint", async () => {
@@ -782,13 +885,13 @@ test('isLoopbackRequest fence accepts loopback and rejects foreign hosts', () =>
   assert.equal(isLoopbackRequest({ headers: { host: '127.0.0.1:43120', 'sec-fetch-site': 'cross-site' } }), false)
 })
 
-/** Minimal loopback POST request + capturing response for channel RPC tests. */
-function rpcCall(channel, method, body) {
-  const payload = JSON.stringify({ type: 'client-request', rpcId: 't', method, payload: body })
-  const chunks = [Buffer.from(payload)]
+/** Minimal loopback POST + capturing response. `rawBody` is sent verbatim so a
+ *  test can also send an envelope that does not match the endpoint. */
+function postRaw(channel, url, rawBody) {
+  const chunks = [Buffer.from(typeof rawBody === 'string' ? rawBody : JSON.stringify(rawBody))]
   const req = {
     method: 'POST',
-    url: '/diff-review/' + method,
+    url,
     headers: { 'content-type': 'application/json', host: '127.0.0.1:43120' },
     [Symbol.asyncIterator]() {
       let i = 0
@@ -798,6 +901,10 @@ function rpcCall(channel, method, body) {
   let out = ''
   const res = { writeHead() {}, end(x) { out = String(x || '') } }
   return channel.handler(req, res).then(() => JSON.parse(out))
+}
+
+function rpcCall(channel, method, body) {
+  return postRaw(channel, '/diff-review/' + method, JSON.stringify({ type: 'client-request', rpcId: 't', method, payload: body }))
 }
 
 /** Mirror of the official Web transport's parseConnectionResponse: it THROWS on
@@ -822,6 +929,39 @@ function rpcValue(resp) {
   return { ok: false, error }
 }
 
+test('channel replies are always a well-formed RPC envelope (failure branches)', async () => {
+  const { ctx, routes } = makeCtx({ withWebServer: true })
+  apply(ctx)
+  const channel = routes.find((r) => r.path === '/diff-review')
+  assert.ok(channel, 'channel attached')
+
+  // (a) Invalid request envelope: the reply must still satisfy the official
+  // contract — parseConnectionResponse THROWS on a bare `{ ok: false, error:
+  // 'string' }`, which is exactly the shape that used to escape the transport.
+  const bad = await postRaw(channel, '/diff-review/turn', { type: 'client-request', rpcId: 't', method: 'summary' })
+  assert.equal(bad.type, 'server-response')
+  assert.equal(rpcValue(bad).ok, false, 'failed replies are RPC failures')
+  assert.equal(bad.result.error.code, 'invalid-envelope')
+  assert.equal(typeof bad.result.error.message, 'string')
+  assert.deepEqual(bad.result.error.details, {})
+
+  // (b) A handler that throws must surface as the failure envelope, not as a
+  // bare payload or a 500 that the transport turns into an opaque error.
+  const boom = makeCtx({ withWebServer: true })
+  Object.defineProperty(boom.ctx.agents, 'get', { get() { throw new Error('registry exploded') } })
+  apply(boom.ctx)
+  const boomChannel = boom.routes.find((r) => r.path === '/diff-review')
+  const failed = await rpcCall(boomChannel, 'summary', { session: 'session-x' })
+  const failure = rpcValue(failed)
+  assert.equal(failure.ok, false, 'a throwing handler replies with ok:false')
+  assert.equal(failed.result.error.code, 'diff-review-handler')
+  assert.match(failed.result.error.message, /registry exploded/)
+  assert.deepEqual(failed.result.error.details, {})
+  // The route stays usable for other endpoints afterwards.
+  const editors = await rpcCall(boomChannel, 'editors', {})
+  assert.equal(Array.isArray(rpcValue(editors).editors), true, 'the channel still serves later requests')
+})
+
 test('host tags ops with the turn from snapshotEvents() (new DSH event surface)', async () => {
   const { ctx, listeners, routes } = makeCtx({ withWebServer: true })
   // New DSH: the session exposes snapshotEvents() instead of the live events
@@ -843,6 +983,38 @@ test('host tags ops with the turn from snapshotEvents() (new DSH event surface)'
   assert.equal(rpcValue(resp).files[0].path, 'src/t.txt')
   const resp0 = await rpcCall(channel, 'turn', { session: 'session-root', turn: 0 })
   assert.equal(rpcValue(resp0).files.length, 0, 'op must not be tagged turn 0')
+})
+
+test('queries are served from the resolved root bucket, never a stale legacy child bucket', async () => {
+  const h = makeLineageCtx()
+  const childId = '9f1c0b7e-1d2a-4f3b-8c4d-5e6f7a8b9c0d'
+  // A pre-v5 state file: the old resolveRootId wrote ops under the bare child
+  // uuid, so such a bucket can still be on disk after the upgrade.
+  writeFileSync(new URL('diff-review-state.json', h.ctx.baseUrl), JSON.stringify({
+    version: 1,
+    sessions: { [childId]: { files: { 'legacy.js': { path: 'legacy.js', cwd: undefined, ops: [{ kind: 'write', content: 'old\n', at: 1, turn: 1 }] } } } }
+  }))
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 3 } }])
+  h.setLive(root)
+  const child = agentOf(childId, { origin: 'subagent', parentSession: 'session-root', delegationDepth: 1 })
+  h.setLive(child)
+  apply(h.ctx)
+  recordWrite(h, root, 'src/new.js', 'new\n')
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  // The child's own view must show what the parent sees — not the stale bucket
+  // the old code left behind under the child id.
+  const viaChild = rpcValue(await rpcCall(channel, 'summary', { session: childId }))
+  assert.deepEqual(viaChild.files.map((f) => f.path), ['src/new.js'], 'the root bucket wins over the legacy child bucket')
+  const viaRoot = rpcValue(await rpcCall(channel, 'summary', { session: 'session-root' }))
+  assert.deepEqual(viaRoot.files.map((f) => f.path), ['src/new.js'])
+
+  // Clearing from a subagent view clears the aggregate AND the legacy bucket,
+  // so a refresh cannot resurrect either half.
+  await rpcCall(channel, 'clear', { session: childId })
+  assert.deepEqual(rpcValue(await rpcCall(channel, 'summary', { session: 'session-root' })).files, [])
+  assert.deepEqual(rpcValue(await rpcCall(channel, 'summary', { session: childId })).files, [])
+  for (const d of h.disposers) d()
 })
 
 test('client unwraps the official RPC envelope and tolerates bare payloads', () => {
@@ -881,12 +1053,12 @@ test('tab badge keeps the host latest-activity window across a fresh turn', () =
   assert.equal(hostWindowItems(window33, 33).length, 3, 'pill shows the current turn window')
 })
 
-test('revert tool resolves @deepseek-ai/dsh-tools from the host install (link: mode)', () => {
+test('revert tool resolves @deepseek-ai/dsh-tools from the host install (link: mode)', (t) => {
   // Regression: with a `link:` install the plugin's real path lives outside the
   // profile, so the ordinary node_modules walk cannot see the HOST's own
   // @deepseek-ai/dsh-tools — startup logged "revert tool import failed" and the
   // diff_review_revert tool silently never registered. The host-anchored
-  // fallback resolves it from the running dsh executable instead.
+  // fallback resolves it from the running dsh entry instead.
   const src = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
   const start = src.indexOf('function hostToolsUrl(')
   assert.notEqual(start, -1, 'hostToolsUrl exists in the host half')
@@ -900,15 +1072,23 @@ test('revert tool resolves @deepseek-ai/dsh-tools from the host install (link: m
   const hostToolsUrl = new Function('createRequire', 'realpathSync', 'pathToFileURL',
     `${src.slice(start, end)}; return hostToolsUrl`)(createRequire, realpathSync, pathToFileURL)
 
-  let bin = null
-  try { bin = execFileSync('sh', ['-c', 'command -v dsh'], { encoding: 'utf8' }).trim() } catch (e) { bin = null }
-  if (!bin) return // no dsh on PATH (e.g. CI): nothing to anchor on
-
+  // A synthetic host install: `<host>/lib/bin.js` plus a hoisted
+  // `<host>/node_modules/@deepseek-ai/dsh-tools`. Deterministic and
+  // platform-independent, so the mechanism is asserted on every machine
+  // (the real-host check below is the one that needs a dsh on PATH).
+  const root = track(mkdtempSync(join(tmpdir(), 'drv-host-')))
+  const hostDir = join(root, 'host')
+  const pkgDir = join(hostDir, 'node_modules', '@deepseek-ai', 'dsh-tools')
+  mkdirSync(join(hostDir, 'lib'), { recursive: true })
+  mkdirSync(join(pkgDir, 'lib'), { recursive: true })
+  writeFileSync(join(hostDir, 'lib', 'bin.js'), '// host entry\n')
+  writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-tools', version: '0.0.0', main: 'lib/index.js' }))
+  writeFileSync(join(pkgDir, 'lib', 'index.js'), 'export const defineTool = () => {}\n')
   const saved = process.argv[1]
-  process.argv[1] = bin
   try {
+    process.argv[1] = join(hostDir, 'lib', 'bin.js')
     const url = hostToolsUrl()
-    assert.ok(url, 'resolves through the host executable')
+    assert.ok(url, 'resolves through the host entry')
     assert.match(url, /@deepseek-ai\/dsh-tools\/lib\/index\.js$/)
   } finally {
     process.argv[1] = saved
@@ -916,4 +1096,35 @@ test('revert tool resolves @deepseek-ai/dsh-tools from the host install (link: m
   // No anchor -> null instead of throwing, so callers report the original error.
   process.argv[1] = '/nonexistent/dsh-entry.js'
   try { assert.equal(hostToolsUrl(), null) } finally { process.argv[1] = saved }
+
+  // Real host, when one is discoverable: the same resolution must land on the
+  // installed package (skipped explicitly rather than silently passing).
+  const bin = findDshEntry()
+  if (!bin) { t.skip('no dsh entry on PATH: real-host anchor not checked'); return }
+  process.argv[1] = bin
+  try {
+    const url = hostToolsUrl()
+    assert.ok(url, 'resolves through the real dsh entry')
+    assert.match(url, /@deepseek-ai\/dsh-tools\/lib\/index\.js$/)
+  } finally {
+    process.argv[1] = saved
+  }
 })
+
+/** Locate the dsh CLI entry cross-platform (PATH lookup + shim unwrapping). */
+function findDshEntry() {
+  try {
+    const out = process.platform === 'win32'
+      ? execFileSync('where', ['dsh'], { encoding: 'utf8' })
+      : execFileSync('sh', ['-c', 'command -v dsh'], { encoding: 'utf8' })
+    const first = String(out).split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0]
+    if (!first) return null
+    const real = realpathSync(first)
+    if (!/\.(cmd|ps1|bat)$/i.test(real)) return real
+    // A shell shim: the real entry is the package bin next to it.
+    const guess = join(dirname(real), '..', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+    return existsSync(guess) ? guess : null
+  } catch (e) {
+    return null
+  }
+}
