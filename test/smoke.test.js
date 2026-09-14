@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
-import { apply, isLoopbackRequest, inject } from '../lib/index.js'
+import { apply, isLoopbackRequest, inject, locateFragment } from '../lib/index.js'
 
 /** Sandboxed profile dir per test, so flushes never touch real user data.
  *  The trailing slash matters: a backslash encodes to %5C (a plain character,
@@ -647,7 +647,7 @@ function makeReactDouble() {
 /** Load the REAL shipped client bundle and boot its plugin wiring against a
  *  stub connection, so tests can drive rebuildReview -> store -> the actual
  *  TabLabel / ReviewView components instead of re-implementing them. */
-function loadRealClient(rpc) {
+function loadRealClient(rpc, opts = {}) {
   const src = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
   const React = makeReactDouble()
   let exports = null
@@ -655,7 +655,13 @@ function loadRealClient(rpc) {
     console,
     setTimeout, clearTimeout,
     matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
-    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    // A remembered editor choice is how the real UI persists it; seeding it makes
+    // open-at-line reach the host's open-with-editor route instead of the
+    // workspace fallback (which cannot position a cursor).
+    localStorage: {
+      getItem: (k) => (opts.editor && k === 'dsh.diff-review.editor' ? JSON.stringify(opts.editor) : null),
+      setItem() {}, removeItem() {}
+    },
     MutationObserver: class { observe() {} disconnect() {} },
     AbortController, URL, RegExp,
     document: {
@@ -1128,3 +1134,185 @@ function findDshEntry() {
     return null
   }
 }
+
+test('locateFragment recovers a fragment line from the before snapshot', () => {
+  const file = ['a', 'b', 'c', 'dup', 'e', 'dup', 'g'].join('\n')
+  // Exact for the first site, and the count is what tells replace_all apart.
+  assert.deepEqual(locateFragment(file, 'dup'), { line: 4, count: 2 })
+  assert.deepEqual(locateFragment(file, 'c\ndup'), { line: 3, count: 1 })
+  assert.deepEqual(locateFragment(file, 'g'), { line: 7, count: 1 })
+  // Nothing to anchor on: no snapshot (legacy op), empty fragment, no match, or a
+  // truncated snapshot. The caller must fall back to relative numbering instead.
+  assert.equal(locateFragment(undefined, 'dup'), null)
+  assert.equal(locateFragment(null, 'dup'), null)
+  assert.equal(locateFragment(file, ''), null)
+  assert.equal(locateFragment(file, 'nope'), null)
+  assert.equal(locateFragment('a\nb', 'g'), null)
+})
+
+test('edit sections report REAL file lines recovered from the before snapshot', async () => {
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 2 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  const before = ['l1', 'l2', 'l3', 'l4', 'l5', 'l6', 'l7'].join('\n')
+  // The fragment keeps context lines so the diff has both sides AND trailing
+  // context — the numbers that used to restart at 1 in every direction.
+  h.listeners.get('tools/result')[0](
+    { tool: 'edit', name: 'edit', input: { file_path: 'src/mid.js', old_string: 'l3\nl4\nl5', new_string: 'l3\nL4\nl5' }, agent: root },
+    { value: { before, after: before.replace('l4', 'L4') } }
+  )
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const detail = rpcValue(await rpcCall(channel, 'file', { session: 'session-root', path: 'src/mid.js' }))
+  const sec = detail.sections[0]
+  assert.equal(sec.lineExact, true, 'the snapshot makes the offset exact')
+  assert.equal(sec.lineBase, 3, 'the base is the fragment\'s first file line (l3)')
+  assert.equal(sec.hunks.find((x) => x.type === 'del').a, 4, 'deletion reports the real file line')
+  assert.equal(sec.hunks.find((x) => x.type === 'add').b, 4, 'insertion reports the real file line')
+  // The line after the change keeps counting from the file, not from the fragment.
+  const ctx = sec.hunks.filter((x) => x.type === 'ctx')
+  assert.equal(ctx[0].a, 3, 'leading context is on real line numbers')
+  assert.equal(ctx[ctx.length - 1].a, 5, 'trailing context stays on real line numbers too')
+  for (const d of h.disposers) d()
+})
+
+test('replace_all edits report every site, and a missing snapshot is marked relative', async () => {
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 3 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  const cb = h.listeners.get('tools/result')[0]
+  const before = ['a', 'dup', 'b', 'dup', 'c'].join('\n')
+  cb(
+    { tool: 'edit', name: 'edit', input: { file_path: 'src/all.js', old_string: 'dup', new_string: 'DUP', replace_all: true }, agent: root },
+    { value: { before, after: before.split('dup').join('DUP') } }
+  )
+  // A legacy record (no before/after value at all): the op is still recorded, but
+  // there is no snapshot to anchor on.
+  cb(
+    { tool: 'edit', name: 'edit', input: { file_path: 'src/legacy.js', old_string: 'x', new_string: 'y' }, agent: root },
+    { value: {} }
+  )
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  const all = rpcValue(await rpcCall(channel, 'file', { session: 'session-root', path: 'src/all.js' }))
+  assert.equal(all.sections[0].lineExact, true)
+  assert.equal(all.sections[0].lineBase, 2, 'the reported line is the FIRST site')
+  assert.equal(all.sections[0].multiMatch, 2, 'replace_all replaced two sites')
+
+  const legacy = rpcValue(await rpcCall(channel, 'file', { session: 'session-root', path: 'src/legacy.js' }))
+  assert.equal(legacy.sections[0].lineExact, false, 'no snapshot -> flagged, not faked')
+  assert.equal(legacy.sections[0].lineBase, null)
+  assert.equal(legacy.sections[0].hunks.find((x) => x.type === 'del').a, 1, 'numbers stay fragment-relative')
+
+  // replace_all is what makes the fragment non-unique, so it is recorded per op.
+  const state = flushedState(h)
+  const ops = state.sessions['session-root'].files['src/all.js'].ops
+  assert.equal(ops[0].replaceAll, true)
+  const legacyOps = state.sessions['session-root'].files['src/legacy.js'].ops
+  assert.equal(legacyOps[0].replaceAll, false)
+  assert.equal('before' in legacyOps[0], false, 'a missing snapshot stays undefined')
+})
+
+test('client: open target per section + the per-turn window cutoff', () => {
+  const sectionOpenLine = clientFunction('sectionOpenLine')
+  const lastLabeledAtOf = clientFunction('lastLabeledAtOf')
+  // New-side anchor = the smallest new-side line the section touches; a pure
+  // deletion has none, so it falls back to the recovered base line.
+  assert.equal(sectionOpenLine({ lineExact: true, hunks: [
+    { type: 'ctx', a: 5, b: 5, text: 'l5' }, { type: 'del', a: 6, b: null, text: 'x' }, { type: 'add', a: null, b: 6, text: 'y' }
+  ] }), 5)
+  assert.equal(sectionOpenLine({ lineExact: true, lineBase: 9, hunks: [{ type: 'del', a: 9, b: null, text: 'gone' }] }), 9)
+  // Fragment-relative sections have no open target at all.
+  assert.equal(sectionOpenLine({ lineExact: false, hunks: [{ type: 'add', a: null, b: 3, text: 'x' }] }), null)
+  assert.equal(sectionOpenLine(null), null)
+
+  // The unlabeled-op cutoff is the newest TAGGED op, not the requested turn's own
+  // ops: that is what stops a new turn from inheriting earlier stragglers.
+  const files = new Map([['p', { ops: [{ turn: 3, at: 100 }, { turn: 0, at: 150 }, { turn: 4, at: 120 }] }]])
+  assert.equal(lastLabeledAtOf(files), 120)
+  assert.equal(lastLabeledAtOf(new Map([['p', { ops: [{ turn: 0, at: 50 }, { at: 60 }] }]])), 0, 'all-unlabeled sessions behave as before')
+  assert.equal(lastLabeledAtOf(new Map()), 0)
+})
+
+test("client: every change opens the editor at its line, and relative numbers are marked", async () => {
+  const line = (n, text, type) => (type === 'add'
+    ? { type: 'add', a: null, b: n, text: text }
+    : type === 'del' ? { type: 'del', a: n, b: null, text: text } : { type: 'ctx', a: n, b: n, text: text });
+  const exactSections = [{ kind: 'edit', at: 5, lineExact: true, lineBase: 3, hunks: [
+    line(3, 'l3', 'ctx'), line(4, 'l4', 'del'), line(4, 'L4', 'add'), line(5, 'l5', 'ctx')
+  ] }];
+  const relSections = [{ kind: 'edit', at: 5, lineExact: false, lineBase: null, hunks: [line(1, 'NEW', 'add')] }];
+  const file = { path: 'src/mid.js', name: 'mid.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 };
+  const settle = () => new Promise((r) => setTimeout(r, 60));
+
+  const boot = async (sections) => {
+    const item = Object.assign({}, file, { sections: sections });
+    const c = loadRealClient(async (endpoint, payload) => {
+      if (endpoint === 'editors') return { editors: [] };
+      if (endpoint === 'summary') return { files: [file], latestTurn: 5 };
+      if (endpoint === 'turn') return { turn: 5, files: [item] };
+      if (endpoint === 'file') return { path: payload.path, sections: sections };
+      if (endpoint === 'open-with-editor') return { ok: true };
+      if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } };
+      if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } };
+      return {};
+    }, { editor: { id: 'vscode', name: 'VS Code' } });
+    c.render(c.slotComp('conversation.session.header.actions').Comp({ sessionId: 'session-root' }));
+    await settle();
+    const view = c.slotComp('conversation.view', 'review');
+    let tree = null;
+    for (let i = 0; i < 3; i++) { tree = c.render(view.Comp({ sessionId: 'session-root' })); await settle(); }
+    c.collect(tree, 'cdx-fl-item')[0].props.onClick(); // select the file -> detail pane
+    await settle();
+    tree = c.render(view.Comp({ sessionId: 'session-root' }));
+    return { c, tree };
+  };
+
+  // Real lines: the section header carries one button, and only the CHANGED row
+  // carries another (context rows do not). Per-row buttons live inside CodexLine,
+  // a nested component, so those elements are expanded explicitly.
+  const expandLines = (c, tree) => {
+    const els = [];
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return;
+      if (typeof node.type === 'function' && node.type.name === 'CodexLine') els.push(node);
+      for (const ch of node.children || []) walk(ch);
+    };
+    walk(tree);
+    return els.map((el) => c.render(el));
+  };
+  const real = await boot(exactSections);
+  const headButtons = real.c.collect(real.tree, 'cdx-open');
+  assert.equal(headButtons.length, 1, 'the section header carries one open button');
+  const rendered = expandLines(real.c, real.tree);
+  assert.equal(rendered.length, 4, 'four rows rendered');
+  const rowButtons = rendered.flatMap((r) => real.c.collect(r, 'cdx-open'));
+  assert.equal(rowButtons.length, 2, 'both changed rows get a button; context rows do not');
+  assert.match(rowButtons[0].props.title, /第 3 行/, 'a deleted row jumps to the section anchor — its own line no longer exists');
+  assert.match(rowButtons[1].props.title, /第 4 行/, 'an added row jumps to its own new-side line');
+
+  rowButtons[1].props.onClick();
+  await settle();
+  let openCalls = real.c.calls.filter((x) => x.endpoint === 'open-with-editor');
+  assert.equal(openCalls.length, 1, 'the click routed to the host editor route');
+  assert.equal(openCalls[0].payload.line, 4, 'the changed row jumps to its own new-side line');
+  assert.equal(openCalls[0].payload.editor, 'vscode', 'the remembered editor is used');
+  headButtons[0].props.onClick();
+  await settle();
+  openCalls = real.c.calls.filter((x) => x.endpoint === 'open-with-editor');
+  assert.equal(openCalls[1].payload.line, 3, 'the header button jumps to the section new-side anchor');
+  assert.equal(real.c.collect(real.tree, 'cdx-sec-note').length, 0, 'exact sections carry no relative badge');
+
+  // Fragment-relative: marked, and NO button that would jump to a made-up line.
+  const rel = await boot(relSections);
+  assert.equal(rel.c.collect(rel.tree, 'cdx-open').length, 0, 'no header button without real lines');
+  const relRendered = expandLines(rel.c, rel.tree);
+  assert.equal(relRendered.flatMap((r) => rel.c.collect(r, 'cdx-open')).length, 0, 'no per-row button either');
+  const notes = rel.c.collect(rel.tree, 'cdx-sec-note');
+  assert.equal(notes.length, 1, 'the relative badge is shown');
+  assert.equal(notes[0].children[0], '相对行号');
+  const gutters = relRendered.flatMap((r) => rel.c.collect(r, 'cdx-gutter'));
+  assert.equal(gutters.some((g) => g.children[0] === '~1'), true, 'the gutter marks the number as relative');
+  assert.equal(rel.c.calls.some((x) => x.endpoint === 'open-with-editor'), false, 'nothing was opened');
+})
