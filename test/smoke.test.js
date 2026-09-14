@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, realpathSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -877,4 +879,41 @@ test('tab badge keeps the host latest-activity window across a fresh turn', () =
   // Pill face: unchanged — the stale window is still suppressed there.
   assert.equal(hostWindowItems(window33, 34), null, 'pill still follows the in-flight turn')
   assert.equal(hostWindowItems(window33, 33).length, 3, 'pill shows the current turn window')
+})
+
+test('revert tool resolves @deepseek-ai/dsh-tools from the host install (link: mode)', () => {
+  // Regression: with a `link:` install the plugin's real path lives outside the
+  // profile, so the ordinary node_modules walk cannot see the HOST's own
+  // @deepseek-ai/dsh-tools — startup logged "revert tool import failed" and the
+  // diff_review_revert tool silently never registered. The host-anchored
+  // fallback resolves it from the running dsh executable instead.
+  const src = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const start = src.indexOf('function hostToolsUrl(')
+  assert.notEqual(start, -1, 'hostToolsUrl exists in the host half')
+  const open = src.indexOf('{', start)
+  let depth = 0
+  let end = -1
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth++
+    else if (src[i] === '}') { depth--; if (depth === 0) { end = i + 1; break } }
+  }
+  const hostToolsUrl = new Function('createRequire', 'realpathSync', 'pathToFileURL',
+    `${src.slice(start, end)}; return hostToolsUrl`)(createRequire, realpathSync, pathToFileURL)
+
+  let bin = null
+  try { bin = execFileSync('sh', ['-c', 'command -v dsh'], { encoding: 'utf8' }).trim() } catch (e) { bin = null }
+  if (!bin) return // no dsh on PATH (e.g. CI): nothing to anchor on
+
+  const saved = process.argv[1]
+  process.argv[1] = bin
+  try {
+    const url = hostToolsUrl()
+    assert.ok(url, 'resolves through the host executable')
+    assert.match(url, /@deepseek-ai\/dsh-tools\/lib\/index\.js$/)
+  } finally {
+    process.argv[1] = saved
+  }
+  // No anchor -> null instead of throwing, so callers report the original error.
+  process.argv[1] = '/nonexistent/dsh-entry.js'
+  try { assert.equal(hostToolsUrl(), null) } finally { process.argv[1] = saved }
 })
