@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
-import { apply, isLoopbackRequest, inject, locateFragment } from '../lib/index.js'
+import { apply, isLoopbackRequest, inject, launchEditor, locateFragment } from '../lib/index.js'
 
 /** Sandboxed profile dir per test, so flushes never touch real user data.
  *  The trailing slash matters: a backslash encodes to %5C (a plain character,
@@ -668,6 +668,7 @@ function loadRealClient(rpc, opts = {}) {
       createElement: () => ({ textContent: '', remove() {} }),
       head: { appendChild() {} },
       body: { addEventListener() {}, removeEventListener() {} },
+      querySelector: () => null,
       querySelectorAll: () => [],
       addEventListener() {}, removeEventListener() {}
     },
@@ -689,11 +690,14 @@ function loadRealClient(rpc, opts = {}) {
   const calls = []
   const registered = []
   const conn = { rpc: { call: (target, endpoint, payload) => { calls.push({ endpoint, payload }); return rpc(endpoint, payload) } } }
+  // `sessionsById` drives updateRunning(): the running pill only renders while the
+  // session reports running, so a test that clicks it has to say so.
+  const sessionsSvc = { list: { getSnapshot: () => ({ byId: opts.sessionsById || {} }) } }
   exports.apply({
-    get: (n) => (n === 'connection' ? conn : undefined),
+    get: (n) => (n === 'connection' ? conn : n === 'sessions' ? sessionsSvc : undefined),
     effect: (fn) => { const d = fn(); if (typeof d === 'function') d(); return () => {} },
     slots: { inject: (n, cb) => { cb() }, register: (def, Comp) => { registered.push({ def, Comp }); return () => {} } },
-    sessions: { list: { getSnapshot: () => ({ byId: {} }) } },
+    sessions: sessionsSvc,
     workspaces: {}
   })
   const slotComp = (name, id) => registered.find((r) => r.def.name === name && (id === undefined || r.def.id === id))
@@ -1315,4 +1319,112 @@ test("client: every change opens the editor at its line, and relative numbers ar
   const gutters = relRendered.flatMap((r) => rel.c.collect(r, 'cdx-gutter'));
   assert.equal(gutters.some((g) => g.children[0] === '~1'), true, 'the gutter marks the number as relative');
   assert.equal(rel.c.calls.some((x) => x.endpoint === 'open-with-editor'), false, 'nothing was opened');
+})
+
+test('open-at-line falls back to the shell preview when no external editor is chosen', async () => {
+  const sections = [{ kind: 'edit', at: 5, lineExact: true, lineBase: 3, hunks: [
+    { type: 'ctx', a: 3, b: 3, text: 'l3' }, { type: 'del', a: 4, b: null, text: 'l4' },
+    { type: 'add', a: null, b: 4, text: 'L4' }, { type: 'ctx', a: 5, b: 5, text: 'l5' }
+  ] }];
+  const file = { path: 'src/mid.js', name: 'mid.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9, sections: sections };
+  const c = loadRealClient(async (endpoint, payload) => {
+    if (endpoint === 'editors') return { editors: [] };
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 };
+    if (endpoint === 'turn') return { turn: 5, files: [file] };
+    if (endpoint === 'file') return { path: payload.path, sections: sections };
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } };
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } };
+    return {};
+  }) // no editor: the shell preview is the only way to land on a line
+  const shellOpens = [];
+  // The chat supplies openFile to turn cards; capturing it there is what lets the
+  // review buttons use the shell's own opener (right-sidebar preview at the line).
+  c.render(c.slotComp('conversation.chat.turnTail').Comp({
+    matched: { turn: 5 }, sessionId: 'session-root', turn: {}, seq: 1,
+    openFile: (path, options) => shellOpens.push([path, options])
+  }));
+  await new Promise((r) => setTimeout(r, 40));
+  c.render(c.slotComp('conversation.session.header.actions').Comp({ sessionId: 'session-root' }));
+  await new Promise((r) => setTimeout(r, 40));
+  const view = c.slotComp('conversation.view', 'review');
+  let tree = null;
+  for (let i = 0; i < 3; i++) { tree = c.render(view.Comp({ sessionId: 'session-root' })); await new Promise((r) => setTimeout(r, 60)); }
+  c.collect(tree, 'cdx-fl-item')[0].props.onClick();
+  await new Promise((r) => setTimeout(r, 40));
+  tree = c.render(view.Comp({ sessionId: 'session-root' }));
+  const expandLines = (t) => {
+    const els = [];
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return;
+      if (typeof node.type === 'function' && node.type.name === 'CodexLine') els.push(node);
+      for (const ch of node.children || []) walk(ch);
+    };
+    walk(t);
+    return els.map((el) => c.render(el));
+  };
+  const buttons = expandLines(tree).flatMap((r) => c.collect(r, 'cdx-open'));
+  assert.equal(buttons.length, 2, 'both changed rows offer a jump');
+  buttons[1].props.onClick(); // the added row
+  // JSON compare: the options object is built in the VM realm, so a
+  // prototype-sensitive deepEqual would not match host-realm objects.
+  assert.equal(JSON.stringify(shellOpens), JSON.stringify([['src/mid.js', { line: 4 }]]), 'the shell preview opens at the line');
+  assert.equal(c.calls.some((x) => x.endpoint === 'open-with-editor'), false, 'no external editor was called');
+})
+
+test('editor launch: a Windows .cmd shim runs through cmd.exe with its args intact', (t) => {
+  if (process.platform !== 'win32') { t.skip('the cmd shim path is Windows-only'); return }
+  // Windows editors are usually installed as a `.cmd` shim, which execFileSync
+  // cannot exec (ENOENT) — the silent cause of an "open in editor" click that
+  // appears to do nothing.
+  const dir = track(mkdtempSync(join(tmpdir(), 'drv-shim-')))
+  const shim = join(dir, 'my editor.cmd')
+  const out = join(dir, 'args.txt')
+  writeFileSync(shim, '@echo off\r\n> "' + out + '" echo %*\r\n')
+  launchEditor(shim, ['--goto', 'D:/ws/some file.js:42:1'])
+  const captured = readFileSync(out, 'utf8').trim()
+  assert.match(captured, /--goto/, 'the editor flag survives the shim')
+  assert.match(captured, /some file\.js:42:1/, 'a path with a space and the :line:col suffix survive')
+})
+
+test('the review tab label exposes the stable selector the pill clicks', () => {
+  const c = loadRealClient(async () => ({}))
+  const def = c.slotComp('conversation.view', 'review').def
+  const label = c.render(def.label())
+  assert.equal(label.props['data-dsh-view'], 'review', 'the label anchors the DOM fallback')
+  assert.equal(c.collect(label, 'drv-tab-label').length, 1)
+})
+
+test('the running pill switches views through the official store action', async () => {
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 }
+  const c = loadRealClient(async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  }, { sessionsById: { 'session-root': { running: true, cwd: 'D:/ws' } } })
+  const opened = []
+  const acknowledged = []
+  const viewProps = (extra) => Object.assign({
+    sessionId: 'session-root',
+    openView: (view, focus) => opened.push([view, focus]),
+    completeViewRequest: () => acknowledged.push(1),
+    viewRequest: { view: 'review', focus: 'jump' }
+  }, extra || {})
+  c.render(c.slotComp('conversation.session.header.actions').Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+  const view = c.slotComp('conversation.view', 'review')
+  // The shell hands conversation.view entries openView; capturing it there is what
+  // lets the pill — whose own slot never receives it — switch views officially.
+  c.render(view.Comp(viewProps()))
+  await new Promise((r) => setTimeout(r, 40))
+  c.render(view.Comp(viewProps()))
+  assert.equal(acknowledged.length >= 1, true, 'the one-shot view request is acknowledged')
+
+  const pillEl = c.render(c.slotComp('conversation.composer.dock').Comp({ sessionId: 'session-root' }))
+  assert.ok(pillEl && pillEl.props && pillEl.props.className === 'cdx-pill', 'the pill renders while the session is running')
+  pillEl.props.onClick()
+  assert.equal(opened.length, 1, 'the click asked the shell for the review view')
+  assert.equal(opened[0][0], 'review')
 })
