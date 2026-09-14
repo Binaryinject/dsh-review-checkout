@@ -1371,6 +1371,52 @@ test('open-at-line falls back to the shell preview when no external editor is ch
   assert.equal(c.calls.some((x) => x.endpoint === 'open-with-editor'), false, 'no external editor was called');
 })
 
+test('opening a file prefers the shell preview even when an external editor was remembered', async () => {
+  const sections = [{ kind: 'edit', at: 5, lineExact: true, lineBase: 3, hunks: [
+    { type: 'ctx', a: 3, b: 3, text: 'l3' }, { type: 'del', a: 4, b: null, text: 'l4' },
+    { type: 'add', a: null, b: 4, text: 'L4' }, { type: 'ctx', a: 5, b: 5, text: 'l5' }
+  ] }];
+  const file = { path: 'src/mid.js', name: 'mid.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9, sections: sections };
+  // A remembered editor from an older build must not resurrect the second picker:
+  // the shell preview owns the editor choice, so it wins.
+  const c = loadRealClient(async (endpoint, payload) => {
+    if (endpoint === 'editors') return { editors: [] };
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 };
+    if (endpoint === 'turn') return { turn: 5, files: [file] };
+    if (endpoint === 'file') return { path: payload.path, sections: sections };
+    if (endpoint === 'open-with-editor') return { ok: true };
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } };
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } };
+    return {};
+  }, { editor: { id: 'vscode', name: 'VS Code' } })
+  const shellOpens = []
+  c.render(c.slotComp('conversation.chat.turnTail').Comp({
+    matched: { turn: 5 }, sessionId: 'session-root', turn: {}, seq: 1,
+    openFile: (path, options) => shellOpens.push([path, options])
+  }))
+  await new Promise((r) => setTimeout(r, 40))
+  c.render(c.slotComp('conversation.session.header.actions').Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+  const view = c.slotComp('conversation.view', 'review')
+  let tree = null
+  for (let i = 0; i < 3; i++) { tree = c.render(view.Comp({ sessionId: 'session-root' })); await new Promise((r) => setTimeout(r, 60)) }
+  c.collect(tree, 'cdx-fl-item')[0].props.onClick()
+  await new Promise((r) => setTimeout(r, 40))
+  tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  const els = []
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return
+    if (typeof node.type === 'function' && node.type.name === 'CodexLine') els.push(node)
+    for (const ch of node.children || []) walk(ch)
+  }
+  walk(tree)
+  const buttons = els.map((el) => c.render(el)).flatMap((r) => c.collect(r, 'cdx-open'))
+  buttons[1].props.onClick()
+  assert.equal(JSON.stringify(shellOpens), JSON.stringify([['src/mid.js', { line: 4 }]]), 'the shell preview opens at the line')
+  assert.equal(c.calls.some((x) => x.endpoint === 'open-with-editor'), false, 'the external route is not used when the shell can open it')
+  assert.equal(c.slotComp('conversation.session.header.utilities', 'diff-review-editor'), undefined, 'the plugin registers no second editor picker')
+})
+
 test('editor launch: a Windows .cmd shim runs through cmd.exe with its args intact', (t) => {
   if (process.platform !== 'win32') { t.skip('the cmd shim path is Windows-only'); return }
   // Windows editors are usually installed as a `.cmd` shim, which execFileSync
