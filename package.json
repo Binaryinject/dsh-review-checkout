@@ -31,6 +31,7 @@
         "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-primitives",
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-sidebar"
       ],
@@ -51,7 +52,8 @@
   ],
   "license": "MIT",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "sync": "node scripts/sync-profile.mjs"
   },
   "repository": {
     "type": "git",

@@ -2,3 +2,10 @@ node_modules/
 *.tgz
 .DS_Store
 *.log
+
+# local-only artifacts (machine config, logs, scratch work, ad-hoc entry drafts)
+config.json
+logs/
+awesome-work/
+awesome-entry/
+pnpm-lock.yaml

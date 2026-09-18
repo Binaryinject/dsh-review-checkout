@@ -680,6 +680,9 @@ function loadRealClient(rpc, opts = {}) {
     load(mod) {
       exports = mod.factory((name) => {
         if (name === 'react') return React
+        // The shell seeds @deepseek-ai/dsh-client-ui-primitives as a static module; a
+        // test can hand in a stub to prove the plugin uses the shell's own file marks.
+        if (name === '@deepseek-ai/dsh-client-ui-primitives' && opts.primitives) return opts.primitives
         throw new Error('unexpected client require: ' + name)
       })
     }
@@ -693,12 +696,25 @@ function loadRealClient(rpc, opts = {}) {
   // `sessionsById` drives updateRunning(): the running pill only renders while the
   // session reports running, so a test that clicks it has to say so.
   const sessionsSvc = { list: { getSnapshot: () => ({ byId: opts.sessionsById || {} }) } }
+  // The host registry enforces one contract per slot kind
+  // (@deepseek-ai/dsh-client-ui-slots register): a `list` slot THROWS when the
+  // registration carries no `id`. Mirroring that here is what catches a
+  // registration that silently stops rendering when a host generation changes the
+  // slot's kind (0.1.6 turned conversation.chat.turnTail from chain into list).
+  const listSlots = new Set(['conversation.chat.turnTail', 'conversation.composer.dock'])
   exports.apply({
     get: (n) => (n === 'connection' ? conn : n === 'sessions' ? sessionsSvc : undefined),
     effect: (fn) => { const d = fn(); if (typeof d === 'function') d(); return () => {} },
-    slots: { inject: (n, cb) => { cb() }, register: (def, Comp) => { registered.push({ def, Comp }); return () => {} } },
+    slots: {
+      inject: (n, cb) => { cb() },
+      register: (def, Comp) => {
+        if (listSlots.has(def.name) && def.id === undefined) throw new Error(`list slot "${def.name}" requires options.id`)
+        registered.push({ def, Comp })
+        return () => {}
+      }
+    },
     sessions: sessionsSvc,
-    workspaces: {}
+    workspaces: opts.workspaces || {}
   })
   const slotComp = (name, id) => registered.find((r) => r.def.name === name && (id === undefined || r.def.id === id))
   const render = (el) => {
@@ -1371,14 +1387,14 @@ test('open-at-line falls back to the shell preview when no external editor is ch
   assert.equal(c.calls.some((x) => x.endpoint === 'open-with-editor'), false, 'no external editor was called');
 })
 
-test('opening a file prefers the shell preview even when an external editor was remembered', async () => {
+test('a chosen external editor opens the file at the line, not the sidebar preview', async () => {
   const sections = [{ kind: 'edit', at: 5, lineExact: true, lineBase: 3, hunks: [
     { type: 'ctx', a: 3, b: 3, text: 'l3' }, { type: 'del', a: 4, b: null, text: 'l4' },
     { type: 'add', a: null, b: 4, text: 'L4' }, { type: 'ctx', a: 5, b: 5, text: 'l5' }
   ] }];
   const file = { path: 'src/mid.js', name: 'mid.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9, sections: sections };
-  // A remembered editor from an older build must not resurrect the second picker:
-  // the shell preview owns the editor choice, so it wins.
+  // The shell's opener does not defer to a chosen editor (measured: VS Code selected,
+  // still the sidebar preview), so a selected editor must win over it.
   const c = loadRealClient(async (endpoint, payload) => {
     if (endpoint === 'editors') return { editors: [] };
     if (endpoint === 'summary') return { files: [file], latestTurn: 5 };
@@ -1412,12 +1428,97 @@ test('opening a file prefers the shell preview even when an external editor was 
   walk(tree)
   const buttons = els.map((el) => c.render(el)).flatMap((r) => c.collect(r, 'cdx-open'))
   buttons[1].props.onClick()
-  assert.equal(JSON.stringify(shellOpens), JSON.stringify([['src/mid.js', { line: 4 }]]), 'the shell preview opens at the line')
-  assert.equal(c.calls.some((x) => x.endpoint === 'open-with-editor'), false, 'the external route is not used when the shell can open it')
-  assert.equal(c.slotComp('conversation.session.header.utilities', 'diff-review-editor'), undefined, 'the plugin registers no second editor picker')
+  const opened = c.calls.filter((x) => x.endpoint === 'open-with-editor')
+  assert.equal(opened.length, 1, 'the chosen editor is used')
+  assert.equal(opened[0].payload.editor, 'vscode', 'by id')
+  assert.equal(opened[0].payload.line, 4, 'and it is told which line to reveal')
+  assert.equal(shellOpens.length, 0, 'the sidebar preview is not used while an editor is chosen')
+  // The picker lives in the review toolbar now (in the header it sat next to the
+  // shell's own "open in app" chip), and it replaced the refresh / clear buttons.
+  assert.equal(c.slotComp('conversation.session.header.utilities', 'diff-review-editor'), undefined, 'no picker chip in the session header')
+  assert.equal(c.collect(tree, 'cdx-tool-btn').length, 0, 'the refresh / clear buttons are gone from the toolbar')
+  const toolbarEditor = c.collect(tree, 'cdx-toolbar-editor')[0]
+  assert.ok(toolbarEditor, 'the toolbar has an editor-picker slot')
+  const pickerEl = c.render(toolbarEditor.children[0])
+  assert.equal(pickerEl.props.className, 'drv-editor', 'the picker renders there')
+  assert.equal(c.collect(pickerEl, 'drv-editor-btn').length, 1, 'with its chip button')
 })
 
-test('editor launch: a Windows .cmd shim runs through cmd.exe with its args intact', (t) => {
+test('the OS default application opens the file when no editor can take it', async () => {
+  const sections = [{ kind: 'edit', at: 5, lineExact: true, lineBase: 3, hunks: [
+    { type: 'ctx', a: 3, b: 3, text: 'l3' }, { type: 'del', a: 4, b: null, text: 'l4' },
+    { type: 'add', a: null, b: 4, text: 'L4' }, { type: 'ctx', a: 5, b: 5, text: 'l5' }
+  ] }];
+  const file = { path: 'src/mid.js', name: 'mid.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9, sections: sections };
+  // The shell's own card opens a presented file through the OS default application
+  // ("用默认应用打开"), which is what actually launches VS Code on this machine. The
+  // plugin's open buttons must have the same last resort instead of doing nothing.
+  const opened = []
+  const c = loadRealClient(async (endpoint, payload) => {
+    if (endpoint === 'editors') return { editors: [] };
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 };
+    if (endpoint === 'turn') return { turn: 5, files: [file] };
+    if (endpoint === 'file') return { path: payload.path, sections: sections };
+    if (endpoint === 'open-with-editor') return { ok: false, error: '编辑器 vscode 未安装或未检测到' };
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } };
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } };
+    return {};
+  }, { workspaces: { openPath: (p) => { opened.push(p); return Promise.resolve() } } })
+  // No turn card is rendered, so no shell opener is captured: preview is unavailable
+  // and the default-application route is the only one left.
+  const view = c.slotComp('conversation.view', 'review')
+  let tree = null
+  for (let i = 0; i < 3; i++) { tree = c.render(view.Comp({ sessionId: 'session-root' })); await new Promise((r) => setTimeout(r, 60)) }
+  c.collect(tree, 'cdx-fl-item')[0].props.onClick()
+  await new Promise((r) => setTimeout(r, 40))
+  tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  const openButtons = () => {
+    const els = []
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return
+      if (typeof node.type === 'function' && node.type.name === 'CodexLine') els.push(node)
+      for (const ch of node.children || []) walk(ch)
+    }
+    walk(tree)
+    return els.map((el) => c.render(el)).flatMap((r) => c.collect(r, 'cdx-open'))
+  }
+  openButtons()[0].props.onClick()
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(opened.length, 1, 'the default application is asked to open the file')
+  assert.match(opened[0], /mid\.js$/, 'with the absolute path')
+
+  // A chosen editor that the host refuses must fall through the same way, not no-op.
+  const opened2 = []
+  const c2 = loadRealClient(async (endpoint, payload) => {
+    if (endpoint === 'editors') return { editors: [] };
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 };
+    if (endpoint === 'turn') return { turn: 5, files: [file] };
+    if (endpoint === 'file') return { path: payload.path, sections: sections };
+    if (endpoint === 'open-with-editor') return { ok: false, error: '编辑器 vscode 未安装或未检测到' };
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } };
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } };
+    return {};
+  }, { editor: { id: 'vscode', name: 'VS Code' }, workspaces: { openPath: (p) => { opened2.push(p); return Promise.resolve() } } })
+  const view2 = c2.slotComp('conversation.view', 'review')
+  let tree2 = null
+  for (let i = 0; i < 3; i++) { tree2 = c2.render(view2.Comp({ sessionId: 'session-root' })); await new Promise((r) => setTimeout(r, 60)) }
+  c2.collect(tree2, 'cdx-fl-item')[0].props.onClick()
+  await new Promise((r) => setTimeout(r, 40))
+  tree2 = c2.render(view2.Comp({ sessionId: 'session-root' }))
+  const els2 = []
+  const walk2 = (node) => {
+    if (!node || typeof node !== 'object') return
+    if (typeof node.type === 'function' && node.type.name === 'CodexLine') els2.push(node)
+    for (const ch of node.children || []) walk2(ch)
+  }
+  walk2(tree2)
+  els2.map((el) => c2.render(el)).flatMap((r) => c2.collect(r, 'cdx-open'))[0].props.onClick()
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(c2.calls.some((x) => x.endpoint === 'open-with-editor'), true, 'the editor was tried first')
+  assert.equal(opened2.length, 1, 'and the default application caught the failure')
+})
+
+test('editor launch: a Windows .cmd shim runs through cmd.exe with its args intact', async (t) => {
   if (process.platform !== 'win32') { t.skip('the cmd shim path is Windows-only'); return }
   // Windows editors are usually installed as a `.cmd` shim, which execFileSync
   // cannot exec (ENOENT) — the silent cause of an "open in editor" click that
@@ -1426,10 +1527,130 @@ test('editor launch: a Windows .cmd shim runs through cmd.exe with its args inta
   const shim = join(dir, 'my editor.cmd')
   const out = join(dir, 'args.txt')
   writeFileSync(shim, '@echo off\r\n> "' + out + '" echo %*\r\n')
-  launchEditor(shim, ['--goto', 'D:/ws/some file.js:42:1'])
-  const captured = readFileSync(out, 'utf8').trim()
+  await launchEditor(shim, ['--goto', 'D:/ws/some file.js:42:1'])
+  // The launch resolves on `spawn`, so the shim may still be writing: poll briefly.
+  let captured = ''
+  for (let i = 0; i < 40 && !captured; i++) {
+    try { captured = readFileSync(out, 'utf8').trim() } catch (e) { await new Promise((r) => setTimeout(r, 50)) }
+  }
   assert.match(captured, /--goto/, 'the editor flag survives the shim')
   assert.match(captured, /some file\.js:42:1/, 'a path with a space and the :line:col suffix survive')
+})
+
+test('editor launch does not wait for the editor to exit', async (t) => {
+  if (process.platform !== 'win32') { t.skip('the cmd shim path is Windows-only'); return }
+  // VS Code keeps running after it takes the file, so a synchronous wait reported
+  // ETIMEDOUT for an editor that HAD opened — and blocked the host the whole time.
+  const dir = track(mkdtempSync(join(tmpdir(), 'drv-detach-')))
+  const shim = join(dir, 'slow editor.cmd')
+  // ~1s of "the editor is still running" after the file is handed over. Kept short
+  // (and window-less: the launch is not detached, so cmd.exe inherits this console
+  // instead of opening its own black window on every test run).
+  writeFileSync(shim, '@echo off\r\nping -n 2 127.0.0.1 >nul\r\n')
+  const started = Date.now()
+  await launchEditor(shim, ['--goto', 'D:/ws/a.js:1:1'])
+  const elapsed = Date.now() - started
+  assert.equal(elapsed < 2000, true, 'the launch returns as soon as the process spawns (took ' + elapsed + 'ms)')
+})
+
+test('an absolute file path is never joined onto the cwd a second time', async () => {
+  const sections = [{ kind: 'edit', at: 5, lineExact: true, lineBase: 3, hunks: [
+    { type: 'add', a: null, b: 4, text: 'L4' }
+  ] }];
+  const file = { path: 'D:/ws/abs.js', name: 'abs.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9, sections: sections };
+  const opened = []
+  const c = loadRealClient(async (endpoint, payload) => {
+    if (endpoint === 'editors') return { editors: [] };
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 };
+    if (endpoint === 'turn') return { turn: 5, files: [file] };
+    if (endpoint === 'file') return { path: payload.path, sections: sections };
+    if (endpoint === 'open-with-editor') return { ok: true };
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } };
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } };
+    return {};
+  }, { editor: { id: 'vscode', name: 'VS Code' }, workspaces: { openPath: (p) => { opened.push(p); return Promise.resolve() } } })
+  const view = c.slotComp('conversation.view', 'review')
+  let tree = null
+  for (let i = 0; i < 3; i++) { tree = c.render(view.Comp({ sessionId: 'session-root' })); await new Promise((r) => setTimeout(r, 60)) }
+  c.collect(tree, 'cdx-fl-item')[0].props.onClick()
+  await new Promise((r) => setTimeout(r, 40))
+  tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  const els = []
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return
+    if (typeof node.type === 'function' && node.type.name === 'CodexLine') els.push(node)
+    for (const ch of node.children || []) walk(ch)
+  }
+  walk(tree)
+  els.map((el) => c.render(el)).flatMap((r) => c.collect(r, 'cdx-open'))[0].props.onClick()
+  await new Promise((r) => setTimeout(r, 20))
+  const openedCall = c.calls.filter((x) => x.endpoint === 'open-with-editor')[0]
+  assert.ok(openedCall, 'the editor route was asked')
+  assert.equal(openedCall.payload.path, 'D:/ws/abs.js', 'the absolute path reaches the host untouched')
+})
+
+test('the editor chip shows the shell’s own application icons', async () => {
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 }
+  const boot = async (editor) => {
+    const c = loadRealClient(async (endpoint) => {
+      if (endpoint === 'editors') return { editors: [] }
+      if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+      if (endpoint === 'turn') return { turn: 5, files: [file] }
+      if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+      if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+      return {}
+    }, editor ? { editor } : {})
+    const view = c.slotComp('conversation.view', 'review')
+    let tree = null
+    for (let i = 0; i < 3; i++) { tree = c.render(view.Comp({ sessionId: 'session-root' })); await new Promise((r) => setTimeout(r, 60)) }
+    // toolbar → EditorPicker → chip → label → EditorIcon: the harness renders one
+    // component level at a time, so walk it explicitly.
+    const pickerView = c.render(c.collect(tree, 'cdx-toolbar-editor')[0].children[0])
+    const label = c.collect(pickerView, 'drv-editor-label')[0]
+    // The chip's label wraps icon + text in a Fragment, so search the subtree.
+    const findIcon = (node) => {
+      if (!node || typeof node !== 'object') return null
+      if (typeof node.type === 'function' && node.type.name === 'EditorIcon') return node
+      for (const ch of node.children || []) { const hit = findIcon(ch); if (hit) return hit }
+      return null
+    }
+    return c.render(findIcon(label))
+  }
+  const icon = await boot({ id: 'vscode', name: 'Visual Studio Code' })
+  assert.equal(icon.props.className, 'drv-editor-icon', 'a real application icon is used')
+  assert.equal(icon.props.src, '/open-in-app/icon/vscode', 'served by the shell icon route (same mark as its own menu)')
+  // Editors the shell's catalog does not know keep the letter avatar.
+  const fallback = await boot({ id: 'notepadpp', name: 'Notepad++' })
+  assert.equal(fallback.props.className, undefined, 'no img for an unmapped editor')
+  assert.equal(fallback.children[0], 'N', 'the letter avatar is used instead')
+})
+
+test('editor probing runs once, not on every review-tab visit', async () => {
+  const editorCalls = []
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 }
+  const c = loadRealClient(async (endpoint) => {
+    if (endpoint === 'editors') { editorCalls.push(1); return { editors: [{ id: 'vscode', name: 'Visual Studio Code', detected: true }] } }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  })
+  const view = c.slotComp('conversation.view', 'review')
+  const draw = () => c.render(view.Comp({ sessionId: 'session-root' }))
+  let tree = null
+  for (let visit = 0; visit < 3; visit++) { tree = draw(); await new Promise((r) => setTimeout(r, 60)) }
+  assert.equal(editorCalls.length, 1, 'the probe runs once for the session, not on every visit')
+  // …and the picker offers an explicit re-probe for after installing something new.
+  const pickerOf = (t) => c.render(c.collect(t, 'cdx-toolbar-editor')[0].children[0])
+  pickerOf(tree) // mounting the picker must not probe again
+  assert.equal(editorCalls.length, 1, 'mounting the picker does not re-probe')
+  c.collect(pickerOf(draw()), 'drv-editor-btn')[0].props.onClick() // open the menu
+  const rescan = c.collect(pickerOf(draw()), 'drv-editor-rescan')[0]
+  assert.ok(rescan, 'the menu offers a re-probe entry')
+  rescan.props.onClick()
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(editorCalls.length, 2, 'the re-probe entry asks the host again')
 })
 
 test('the review tab label exposes the stable selector the pill clicks', () => {
@@ -1473,4 +1694,222 @@ test('the running pill switches views through the official store action', async 
   pillEl.props.onClick()
   assert.equal(opened.length, 1, 'the click asked the shell for the review view')
   assert.equal(opened[0][0], 'review')
+})
+
+test('the running pill cannot be squeezed into a one-glyph column by the dock row', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  const rule = /\.cdx-pill \{[^}]*\}/.exec(source)
+  assert.ok(rule, 'the .cdx-pill rule ships')
+  // Host 0.1.6 wraps `conversation.composer.dock` in a horizontal flex row
+  // (.uV2eYG_dock) next to the built-in ContextMeter (flex:none) and to other
+  // plugins' entries. CJK text breaks between every glyph, so this pill was the
+  // only item that could shrink and it collapsed to one character per line —
+  // with border-radius:999px, a ball. The shrink guard is the fix.
+  assert.match(rule[0], /flex:0 0 auto/, 'the pill refuses to shrink')
+  assert.match(rule[0], /white-space:nowrap/, 'the label stays on one line')
+  // The chip wears the per-turn card's skin — same fill, border, radius and count
+  // colors (theme tokens), so the two never drift apart again.
+  assert.match(rule[0], /--dsw-static-neutral-50/, 'the chip takes the card fill token')
+  assert.match(rule[0], /--dsw-alias-border-l1/, 'and the card border token')
+  assert.match(rule[0], /border-radius:16px/, 'and the card radius')
+  assert.equal(/colors\.turn|turnBg|turnBorder/.test(source), false, 'no plugin palette left on the chip or card')
+})
+
+test('the turn card registration serves both host slot generations (chain <=0.1.5, list 0.1.6+)', async () => {
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 }
+  const c = loadRealClient(async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  })
+  const tail = c.slotComp('conversation.chat.turnTail')
+  assert.ok(tail, 'the per-turn card is registered')
+  // 0.1.6+ (list): a stable id is mandatory — the registry stub above throws
+  // without it, exactly like the host, which is how the card went missing.
+  assert.equal(typeof tail.def.id, 'string', 'the list host addresses the entry by id')
+  assert.equal(typeof tail.def.order, 'number', 'the list host orders it among the contributions')
+  // <=0.1.5 (chain): `select` is the mandatory election there.
+  assert.equal(typeof tail.def.select, 'function', 'the chain host still gets its selector')
+  assert.equal(tail.def.select({ turn: { turn: 5 } }).turn, 5)
+  assert.equal(tail.def.select({ turn: {} }), null, 'a turn without a number declines')
+  // New-host props: the TurnLocation arrives directly and there is no `matched`.
+  // Reading `matched.turn` alone left the card blank on 0.1.6.
+  const props = { sessionId: 'session-root', turn: { turn: 5 }, seq: 3, openFile: () => {} }
+  c.render(tail.Comp(props))
+  await new Promise((r) => setTimeout(r, 40))
+  const tree = c.render(tail.Comp(props))
+  // The card wears the official changed-files skin (cdx-cf-*), so assert on its markup.
+  const titles = c.collect(tree, 'cdx-cf-title')
+  assert.equal(titles.length, 1, 'the per-turn card renders from the owner props alone')
+  assert.match(String(titles[0].props.title), /a\.js/, 'the card names the edited file')
+  assert.equal(c.collect(tree, 'cdx-cf-tile').length, 1, 'the header shows the official tile')
+  assert.equal(c.collect(tree, 'cdx-cf-btn').length, 2, 'the plugin still offers 撤销 / 审核')
+})
+
+test('the per-turn card folds past three files, like the official card', async () => {
+  const files = [1, 2, 3, 4, 5].map((n) => ({ path: `src/f${n}.js`, name: `f${n}.js`, cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: n, removed: 1, lastTime: 9 + n }))
+  const c = loadRealClient(async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files, latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  })
+  const tail = c.slotComp('conversation.chat.turnTail')
+  const props = { sessionId: 'session-root', turn: { turn: 5 }, seq: 3, openFile: () => {} }
+  c.render(tail.Comp(props))
+  await new Promise((r) => setTimeout(r, 40))
+  let tree = c.render(tail.Comp(props))
+  assert.equal(c.collect(tree, 'cdx-cf-row').length, 3, '5 files fold down to the official 3-row summary')
+  const fold = c.collect(tree, 'cdx-cf-toggle')[0]
+  assert.ok(fold, 'the fold row is offered')
+  assert.equal(fold.children[0].children[0], '全部 5 个文件')
+  fold.props.onClick({ stopPropagation() {} })
+  tree = c.render(tail.Comp(props))
+  assert.equal(c.collect(tree, 'cdx-cf-row').length, 5, 'the fold row reveals every file')
+  assert.equal(c.collect(tree, 'cdx-cf-toggle')[0].children[0].children[0], '收起')
+  // <=3 files: no fold row at all, matching the official card.
+  const short = loadRealClient(async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: files.slice(0, 3), latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: files.slice(0, 3) }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  })
+  const shortTail = short.slotComp('conversation.chat.turnTail')
+  short.render(shortTail.Comp(props))
+  await new Promise((r) => setTimeout(r, 40))
+  const shortTree = short.render(shortTail.Comp(props))
+  assert.equal(short.collect(shortTree, 'cdx-cf-row').length, 3, 'a short list shows every row')
+  assert.equal(short.collect(shortTree, 'cdx-cf-toggle').length, 0, 'and offers no fold row')
+})
+
+test('file-type marks come from the shell primitives when that module is present', async () => {
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 }
+  const rpc = async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  }
+  // A stand-in for the shell's FileTypeIcon: the plugin must delegate to it, at the
+  // row's size, instead of drawing its own letter chip.
+  const seen = []
+  const FileTypeIcon = (props) => {
+    seen.push(props)
+    return { type: 'span', props: { className: 'dsh-filetype-icon', 'data-path': props.path }, children: [] }
+  }
+  const withShell = loadRealClient(rpc, { primitives: { FileTypeIcon } })
+  const view = withShell.slotComp('conversation.view', 'review')
+  const settle = () => new Promise((r) => setTimeout(r, 60))
+  // Render/settle passes: the stub runs effects during render and the async host
+  // loads resolve between passes (same dance as the other review-view tests).
+  let tree = null
+  for (let i = 0; i < 5; i++) { tree = withShell.render(view.Comp({ sessionId: 'session-root' })); await settle() }
+  assert.equal(withShell.collect(tree, 'cdx-fl-item').length, 1, 'the file row rendered')
+  // The badge is a nested component: the harness renders one level at a time, so the
+  // mark is reached by rendering the row's badge element itself.
+  const badgeOf = (c, t) => c.collect(t, 'cdx-fl-item')[0].children
+    .find((ch) => ch && typeof ch.type === 'function' && ch.type.name === 'FileTypeBadge')
+  const mark = withShell.render(withShell.render(badgeOf(withShell, tree)).children[0])
+  assert.equal(mark.props.className, 'dsh-filetype-icon', 'the shell mark is used inside the row')
+  assert.equal(seen[0].path, 'src/a.js', 'the mark is asked for the row path')
+  assert.equal(seen[0].size, 16, 'at the row size')
+  // Without the module (Desktop / older compositions) the plugin still renders a mark.
+  const withoutShell = loadRealClient(rpc)
+  const view2 = withoutShell.slotComp('conversation.view', 'review')
+  let tree2 = null
+  for (let i = 0; i < 5; i++) { tree2 = withoutShell.render(view2.Comp({ sessionId: 'session-root' })); await settle() }
+  const fallback = withoutShell.render(badgeOf(withoutShell, tree2))
+  assert.equal(fallback.props.className, 'cdx-filetype', 'the letter chip is the fallback')
+  assert.equal(fallback.children[0], 'JS', 'and it names the type')
+})
+
+test('the plugin takes the turn cards over: official ones hidden, ours marked apart', async () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  const rule = /const OFFICIAL_CARD_CSS = "([^"]+)"/.exec(source)
+  assert.ok(rule, 'the takeover rule ships')
+  assert.match(rule[1], /\[data-changed-files\]/, 'the official changed-files card is targeted')
+  // Delivery stays the shell's feature: its presented-files block is NOT hidden.
+  assert.equal(/data-after-changes/.test(rule[1]), false, 'the official delivered-files block stays visible')
+  // Our own card must not carry the official attribute, or the rule would hide it too.
+  assert.equal(source.includes('"data-changed-files"'), false, 'our card never uses the official attribute')
+  assert.equal(source.includes('"data-dsh-review-card"'), true, 'and carries its own marker instead')
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 }
+  const c = loadRealClient(async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  })
+  const tail = c.slotComp('conversation.chat.turnTail')
+  const props = { sessionId: 'session-root', turn: { turn: 5 }, seq: 3, openFile: () => {} }
+  c.render(tail.Comp(props))
+  await new Promise((r) => setTimeout(r, 40))
+  const card = c.collect(c.render(tail.Comp(props)), 'cdx-cf-card')[0]
+  assert.equal(card.props['data-dsh-review-card'], true, 'our card is marked with its own attribute')
+  assert.equal(card.props['data-changed-files'], undefined, 'and not with the official one')
+})
+
+test('settings can hand the shell cards back', async () => {
+  const c = loadRealClient(async () => ({}))
+  const section = c.slotComp('settings.section', 'diff-review')
+  assert.ok(section, 'the settings section registered')
+  let tree = c.render(section.Comp({}))
+  let box = c.collect(tree, 'drv-official-toggle')[0]
+  assert.ok(box, 'the takeover toggle renders')
+  assert.equal(box.props.checked, true, 'the plugin takes the cards over by default')
+  box.props.onChange({ target: { checked: false } })
+  tree = c.render(section.Comp({}))
+  box = c.collect(tree, 'drv-official-toggle')[0]
+  assert.equal(box.props.checked, false, 'unchecking hands them back to the shell')
+})
+
+test('the split divider clamps the file list so neither pane collapses', () => {
+  const clampListWidth = clientFunction('clampListWidth')
+  assert.equal(clampListWidth(300, 900, 140, 260), 300, 'a sane width passes through')
+  assert.equal(clampListWidth(50, 900, 140, 260), 140, 'the list keeps its floor')
+  assert.equal(clampListWidth(800, 900, 140, 260), 640, 'the diff keeps its share (900 - 260)')
+  assert.equal(clampListWidth(400, 0, 140, 260), 400, 'an unknown pane width enforces only the floor')
+  assert.equal(clampListWidth(NaN, 900, 140, 260), 140, 'a broken drag lands on the floor')
+})
+
+test('the review split view has a draggable divider that resizes the file list', async () => {
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 }
+  const c = loadRealClient(async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  })
+  const view = c.slotComp('conversation.view', 'review')
+  const draw = () => c.render(view.Comp({ sessionId: 'session-root' }))
+  c.render(view.Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+  let tree = draw()
+  const splitter = c.collect(tree, 'cdx-splitter')[0]
+  assert.ok(splitter, 'the split view renders a divider between the panes')
+  assert.equal(splitter.props.role, 'separator')
+  assert.equal(c.collect(tree, 'cdx-filelist')[0].props.style, undefined, 'until dragged, CSS owns the width')
+  // Drag right by 100px. The DOM-less harness has no pane metrics, so the math
+  // falls back to the floor plus the pointer delta (default list width: 270px).
+  splitter.props.onPointerDown({ clientX: 200, currentTarget: null, preventDefault() {} })
+  splitter.props.onPointerMove({ clientX: 300 })
+  splitter.props.onPointerUp({})
+  const dragged = c.collect(draw(), 'cdx-filelist')[0]
+  assert.equal(dragged.props.style.width, '370px', 'the list follows the divider')
+  // Double-click drops the dragged width and hands the pane back to CSS.
+  c.collect(draw(), 'cdx-splitter')[0].props.onDoubleClick()
+  assert.equal(c.collect(draw(), 'cdx-filelist')[0].props.style, undefined, 'double-click restores the responsive default')
 })
