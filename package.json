@@ -1,7 +1,7 @@
 {
   "name": "dsh-review-checkout",
   "version": "0.8.0",
-  "description": "File-change review for DeepSeek Harness sessions: Codex-style per-turn cards (one per turn with workspace-relative paths), a turn-scoped review tab with syntax-highlighted diffs and sticky file headers, per-turn revert via op sequences, light/dark color presets that follow the DSH theme live, live polling — powered by the official session-history channel.",
+  "description": "File-change review for DeepSeek Harness sessions: per-turn change cards styled like the official deliverables card with one-click per-turn revert, a turn-scoped review tab (draggable split diff, syntax highlighting, real line numbers), and a three-step open chain (chosen editor at the line -> OS default app -> built-in preview).",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
