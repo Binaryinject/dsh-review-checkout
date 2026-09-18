@@ -1,6 +1,6 @@
 {
   "name": "dsh-review-checkout",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "File-change review for DeepSeek Harness sessions: per-turn change cards styled like the official deliverables card with one-click per-turn revert, a turn-scoped review tab (draggable split diff, syntax highlighting, real line numbers), and a three-step open chain (chosen editor at the line -> OS default app -> built-in preview).",
   "type": "module",
   "main": "lib/index.js",
