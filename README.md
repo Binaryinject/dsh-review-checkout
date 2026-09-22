@@ -96,6 +96,12 @@ lib/client.js（客户端）──► 每 5s 轮询重建 ──► 卡片 / 审
 - 卡片上的 `撤销` 会按轮生成**倒序**的调用序列（最后一个操作先撤），填进输入框由你确认发送——插件不替模型执行工具调用。
 - 审查视图详情头部还有一个单文件 `还原` 按钮。
 
+### 为什么自建撤回（官方没有回滚机制）
+
+官方 DSH 不提供文件内容回滚，也不保留可回滚的基线：客户端文件服务只读（`workspaceFiles` 没有 mutation）、`str_replace_editor` 未实现上游的 `undo_edit`、`write`/`edit` 的 `before`/`after` 全文只在结果时被压成 3 行上下文的 diff hunk，落盘的 meta 里没有全文。所以「撤销」必须由本插件自己存快照、并走 agent 工具通道写回。
+
+完整审计（对象 `0.1.5-rc.2`，含全部证据路径、逐字原文与复核命令）：[docs/official-file-revert-audit.md](docs/official-file-revert-audit.md)。
+
 ## 兼容性
 
 | 环境 | 状态 |
@@ -107,7 +113,7 @@ lib/client.js（客户端）──► 每 5s 轮询重建 ──► 卡片 / 审
 ## 开发
 
 ```bash
-npm test                 # 78 条测试（node:test，含 host 与客户端冒烟）
+npm test                 # 79 条测试（node:test，含 host 与客户端冒烟）
 npm run sync             # 把 lib/*.js 与 package.json 复制进实际被加载的 profile 副本
 ```
 
@@ -120,6 +126,7 @@ lib/index.js            Host 插件（记录、持久化、RPC 端点、revert �
 lib/client.js           客户端 bundle（单文件，DSH client-modules 加载）
 scripts/sync-profile.mjs  同步到 profile 副本
 test/smoke.test.js      测试
+docs/official-file-revert-audit.md  官方回滚能力审计（为什么必须自建撤回）
 ```
 
 ## 已知限制
