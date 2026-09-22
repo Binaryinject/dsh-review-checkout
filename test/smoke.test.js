@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
-import { apply, isLoopbackRequest, inject, launchEditor, locateFragment } from '../lib/index.js'
+import { apply, isLoopbackRequest, inject, launchEditor, locateFragment, fontFamiliesFromRegistry, fontFamiliesFromRegistryName, fontFamiliesFromFcList } from '../lib/index.js'
 
 /** Sandboxed profile dir per test, so flushes never touch real user data.
  *  The trailing slash matters: a backslash encodes to %5C (a plain character,
@@ -1360,6 +1360,80 @@ test('a legacy op with no snapshot of its own takes its real line from the file 
   assert.equal(gone.sections[0].lineExact, false)
   assert.equal(gone.sections[0].lineSource, null)
   for (const d of h.disposers) d()
+})
+
+test('system font enumeration reads registry and fontconfig shapes', () => {
+  // The Windows Fonts key spells out style variants and joins aliases with " & ".
+  assert.deepEqual(fontFamiliesFromRegistryName('Microsoft YaHei & Microsoft YaHei UI (TrueType)'), ['Microsoft YaHei', 'Microsoft YaHei UI'])
+  assert.deepEqual(fontFamiliesFromRegistryName('Arial Bold Italic (TrueType)'), ['Arial'])
+  assert.deepEqual(fontFamiliesFromRegistryName('Cascadia Mono Light (TrueType)'), ['Cascadia Mono'])
+  // A real family whose own name ends in a style word survives (only the LAST
+  // style word is stripped, repeatedly, never the family itself).
+  assert.deepEqual(fontFamiliesFromRegistryName('Arial Narrow Bold (TrueType)'), ['Arial Narrow'])
+  assert.deepEqual(fontFamiliesFromRegistryName('华文仿宋 (TrueType)'), ['华文仿宋'])
+  assert.deepEqual(fontFamiliesFromRegistryName(''), [])
+  // A .reg body: only value-name lines count, and the export is UTF-16LE text.
+  const reg = [
+    'Windows Registry Editor Version 5.00',
+    '',
+    '[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts]',
+    '"Arial (TrueType)"="arial.ttf"',
+    '"SimSun & NSimSun (TrueType)"="simsun.ttc"',
+    '"Courier New Bold (TrueType)"="courbd.ttf"'
+  ].join('\r\n')
+  assert.deepEqual(fontFamiliesFromRegistry(reg), ['Arial', 'SimSun', 'NSimSun', 'Courier New'])
+  // fontconfig lists several localized names per family, comma separated.
+  assert.deepEqual(fontFamiliesFromFcList('DejaVu Sans,DejaVu Sans Book\nNoto Sans CJK SC'), ['DejaVu Sans', 'DejaVu Sans Book', 'Noto Sans CJK SC'])
+  assert.deepEqual(fontFamiliesFromFcList(''), [])
+})
+
+test('client font stack quotes the family and keeps the official token behind it', () => {
+  const fontStackFor = clientFunction('fontStackFor')
+  assert.equal(fontStackFor('Microsoft YaHei', '--dsw-font-family'), '"Microsoft YaHei", var(--dsw-font-family)')
+  assert.equal(fontStackFor('  Fira Code  ', '--ds-font-family-code'), '"Fira Code", var(--ds-font-family-code)')
+  // Follow mode yields null, so the caller removes the variables entirely and the
+  // stylesheet resolves var(--drv-font-ui, …) to the official token / inherit.
+  assert.equal(fontStackFor('', '--dsw-font-family'), null)
+  assert.equal(fontStackFor(null, '--dsw-font-family'), null)
+  assert.equal(fontStackFor('   ', '--dsw-font-family'), null)
+  // Quotes and backslashes cannot break out of the CSS string.
+  assert.equal(fontStackFor('Ev"il\\', '--dsw-font-family'), '"Evil", var(--dsw-font-family)')
+})
+
+test('font size stepper clamps its delta and labels the follow state', () => {
+  const clampFontDelta = clientFunction('clampFontDelta')
+  assert.equal(clampFontDelta(3, -4, 8), 3)
+  assert.equal(clampFontDelta(99, -4, 8), 8, 'clamped to the maximum')
+  assert.equal(clampFontDelta(-99, -4, 8), -4, 'clamped to the minimum')
+  assert.equal(clampFontDelta(2.6, -4, 8), 3, 'fractional steps round')
+  assert.equal(clampFontDelta('abc', -4, 8), 0, 'junk falls back to follow')
+  assert.equal(clampFontDelta(NaN, -4, 8), 0)
+  const fontDeltaLabel = clientFunction('fontDeltaLabel')
+  assert.equal(fontDeltaLabel(0), '跟随')
+  assert.equal(fontDeltaLabel(2), '+2')
+  assert.equal(fontDeltaLabel(-1), '−1')
+  assert.equal(fontDeltaLabel('x'), '跟随')
+})
+
+test('plugin typography routes through the official tokens so skins and font size reach it', () => {
+  // Regression: hardcoded stacks meant a skin that only rewrites --dsw-* variables
+  // (e.g. dsh-client-ui-skin-claude) and DSH's own content font size changed the
+  // shell but never this plugin's diff, paths or stats.
+  const src = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  assert.equal(/font-family:\s*ui-monospace/.test(src), false, 'no hardcoded monospace stack')
+  assert.equal(/font-family:inherit/.test(src), false, 'inherit goes through the widget variable first')
+  assert.ok(src.includes('font-family:var(--drv-font-ui, inherit)'), 'UI font can be overridden per plugin')
+  const codeStacks = (src.match(/font-family:var\(--drv-font-code, /g) || []).length
+  assert.ok(codeStacks >= 12, 'every code-font declaration resolves through the plugin variable')
+  assert.equal(/font-family:var\(--ds-font-family-code/.test(src), false, 'no declaration bypasses the plugin variable')
+  // The size stepper rides every size and line-height, not only the toolbar.
+  assert.equal(/font-size:calc\(var\(--dsh-content-font-size, 14px\) [+-] \d/.test(src), false, 'every size carries the stepper delta')
+  assert.equal(/line-height:calc\(\d+(?:\.\d+)?px \+ var\(--dsh-content-font-delta, 0px\)\)/.test(src), false, 'every line-height carries the stepper delta')
+  assert.ok(src.includes('var(--drv-font-delta, 0px)'), 'the stepper variable is wired in')
+  // Sizes ride the DSH content font size; only the glyph-in-a-box badge stays fixed.
+  const withoutBadge = src.replace(/font-size:8\.5px/g, '')
+  assert.equal(/font-size:\s*\d+(?:\.\d+)?px/.test(withoutBadge), false, 'no fixed px text size left')
+  assert.ok(src.includes('var(--dsh-content-font-size, 14px)'), 'sizes derive from the official setting')
 })
 
 test('edit sections report REAL file lines recovered from the before snapshot', async () => {
