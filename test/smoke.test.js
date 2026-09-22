@@ -1258,6 +1258,110 @@ test('locateFragment recovers a fragment line from the before snapshot', () => {
   assert.equal(locateFragment('a\nb', 'g'), null)
 })
 
+test('locateFragment matches text, not whole lines (CRLF included)', () => {
+  const file = ['l1', '  foo = 1;', 'l3'].join('\n')
+  // A fragment that is only PART of a line: whole-line comparison returned null
+  // here, which pushed those edits onto the relative-number fallback even though
+  // the offset was right there (21 of 723 edits in one real state file).
+  assert.deepEqual(locateFragment(file, 'foo = 1'), { line: 2, count: 1 })
+  assert.deepEqual(locateFragment(file, 'foo'), { line: 2, count: 1 })
+  // A fragment that starts mid-line and continues onto the next line.
+  assert.deepEqual(locateFragment(file, '= 1;\nl3'), { line: 2, count: 1 })
+  // A CRLF checkout whose old_string arrives with bare \n still locates.
+  const crlf = 'a\r\nold\r\nc'
+  assert.deepEqual(locateFragment(crlf, 'old'), { line: 2, count: 1 })
+  assert.deepEqual(locateFragment(crlf, 'a\nold'), { line: 1, count: 1 })
+  assert.deepEqual(locateFragment(crlf, 'a\r\nold'), { line: 1, count: 1 })
+  // Regex metacharacters in the fragment are literal, not a pattern.
+  assert.deepEqual(locateFragment('x\nf(a)[b]\ny', 'f(a)[b]'), { line: 2, count: 1 })
+  assert.equal(locateFragment('x\nf(a)[b]\ny', 'f(a)b'), null)
+  // The client mirror must agree with the host on all of it.
+  const locateFragmentL = clientFunction('locateFragmentL')
+  for (const [before, fragment, expected] of [
+    [file, 'foo = 1', { line: 2, count: 1 }],
+    [file, '= 1;\nl3', { line: 2, count: 1 }],
+    [crlf, 'a\nold', { line: 1, count: 1 }],
+    ['x\nf(a)[b]\ny', 'f(a)b', null]
+  ]) {
+    assert.deepEqual(locateFragmentL(before, fragment), expected, 'client mirror: ' + JSON.stringify(fragment))
+  }
+})
+
+test('a snapshot cut by the storage cap still reports REAL lines, and its revert is refused', async () => {
+  // A huge file is stored capped at MAX_CHARS (120000), and the edit here sits
+  // PAST the cut, so the stored snapshot cannot locate it. Recovering the offset
+  // at edit time from the UNTRUNCATED text (lineHint) keeps the gutter on real
+  // file lines — and that same op must never be reverted from the cut snapshot,
+  // because writing 120000 characters back would destroy the rest of the file.
+  // Both halves come from one real ~200 KB Unity prefab that did exactly this.
+  const h = makeLineageCtx()
+  const sandboxDir = fileURLToPath(new URL('.', h.ctx.baseUrl))
+  const target = join(sandboxDir, 'huge-prefab.txt')
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 8 } }])
+  h.setLive(root)
+  apply(h.ctx)
+
+  const filler = Array.from({ length: 2000 }, (_, i) => 'line' + i + ' ' + 'x'.repeat(80)).join('\n')
+  const before = filler + '\nTARGET_LINE\ntail\n'
+  const after = before.replace('TARGET_LINE', 'CHANGED_LINE')
+  const expectedLine = before.split('\n').indexOf('TARGET_LINE') + 1
+  assert.ok(before.length > 120000, 'the fixture really is bigger than the snapshot cap')
+  h.listeners.get('tools/result')[0](
+    { tool: 'edit', name: 'edit', input: { file_path: target, old_string: 'TARGET_LINE', new_string: 'CHANGED_LINE' }, agent: root },
+    { value: { before, after } }
+  )
+  writeFileSync(target, after)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  const detail = rpcValue(await rpcCall(channel, 'file', { session: root.id, path: target }))
+  assert.equal(detail.sections[0].lineExact, true, 'the real line survived the cap')
+  assert.equal(detail.sections[0].lineBase, expectedLine)
+  assert.equal(detail.sections[0].hunks.find((x) => x.type === 'add').b, expectedLine, 'the added line carries the real line number')
+
+  const resp = rpcValue(await rpcCall(channel, 'revert', { session: root.id, path: target, op: null }))
+  assert.equal(resp.ok, false, 'a cut snapshot is never written back')
+  assert.match(resp.error, /截断/)
+  assert.equal(readFileSync(target, 'utf8'), after, 'the file keeps its full content')
+  for (const d of h.disposers) d()
+})
+
+test('a legacy op with no snapshot of its own takes its real line from the file on disk', async () => {
+  // The last case left for relative numbering: an op recorded before lineHint
+  // existed whose snapshot the cap cut (the 200 KB prefab again). Nothing inside
+  // the record can locate it, so the CURRENT file is the only source — and the
+  // right one, since the gutter's whole job is to open that file at that line.
+  const h = makeLineageCtx()
+  const sandboxDir = fileURLToPath(new URL('.', h.ctx.baseUrl))
+  const target = join(sandboxDir, 'legacy-op.txt')
+  const missing = join(sandboxDir, 'legacy-gone.txt')
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 3 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  writeFileSync(target, ['l1', 'l2', '  anchor = OLD;', 'l4'].join('\n'))
+  // `value: {}` is the legacy shape: no before/after snapshot at all.
+  h.listeners.get('tools/result')[0](
+    { tool: 'edit', name: 'edit', input: { file_path: target, old_string: 'anchor = OLD', new_string: 'anchor = NEW' }, agent: root },
+    { value: {} }
+  )
+  h.listeners.get('tools/result')[0](
+    { tool: 'edit', name: 'edit', input: { file_path: missing, old_string: 'nowhere', new_string: 'elsewhere' }, agent: root },
+    { value: {} }
+  )
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  const detail = rpcValue(await rpcCall(channel, 'file', { session: root.id, path: target }))
+  assert.equal(detail.sections[0].lineExact, true, 'the disk lookup gives a real file line')
+  assert.equal(detail.sections[0].lineBase, 3)
+  assert.equal(detail.sections[0].lineSource, 'disk')
+  assert.equal(detail.sections[0].hunks.find((x) => x.type === 'del').a, 3, 'the removed line carries it too')
+
+  // No file on disk either: relative numbering stays, flagged rather than faked.
+  const gone = rpcValue(await rpcCall(channel, 'file', { session: root.id, path: missing }))
+  assert.equal(gone.sections[0].lineExact, false)
+  assert.equal(gone.sections[0].lineSource, null)
+  for (const d of h.disposers) d()
+})
+
 test('edit sections report REAL file lines recovered from the before snapshot', async () => {
   const h = makeLineageCtx()
   const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 2 } }])
