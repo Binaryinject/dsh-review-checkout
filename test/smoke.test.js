@@ -1155,6 +1155,94 @@ function findDshEntry() {
   }
 }
 
+/** Slice the balanced `{...}` literal starting at/after `anchor`, so a source
+ *  declaration (here: the revert tool's output schema) can be asserted on
+ *  directly instead of restated in the test. */
+function objectLiteralAfter(source, anchor) {
+  const open = source.indexOf('{', anchor)
+  assert.notEqual(open, -1, `an object literal follows ${JSON.stringify(anchor)}`)
+  let depth = 0
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '{') depth++
+    else if (source[i] === '}') {
+      depth--
+      if (depth === 0) return source.slice(open, i + 1)
+    }
+  }
+  assert.fail('the object literal is balanced')
+}
+
+/** The HOST's own output validator, when a dsh install is discoverable: the
+ *  schema below is enforced by that code, so validating with it is the real
+ *  contract rather than a second copy of the rule. */
+async function hostOutputValidator() {
+  const bin = findDshEntry()
+  if (bin) {
+    try {
+      const req = createRequire(bin)
+      const mod = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-tools')).href)
+      if (typeof mod.validateJsonSchemaValue === 'function') return mod.validateJsonSchemaValue
+    } catch (e) {}
+  }
+  try {
+    const mod = await import('@deepseek-ai/dsh-tools')
+    if (typeof mod.validateJsonSchemaValue === 'function') return mod.validateJsonSchemaValue
+  } catch (e) {}
+  return null
+}
+
+test('revert tool output schema declares every field the revert body returns', async (t) => {
+  // Regression: the host validates the tool body against the DECLARED output
+  // schema with additionalProperties:false, while doRevert answers
+  // { ok, mode, message }. `mode` was undeclared, so every successful revert
+  // (the per-turn 撤销 button fills exactly this tool call into the composer)
+  // came back as `tool "diff_review_revert" returned invalid output:
+  // "value.mode" is not a declared property (additionalProperties: false)` —
+  // an error the user reads as a failed revert although the file was restored.
+  const src = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const anchor = src.indexOf("name: 'diff_review_revert'")
+  assert.notEqual(anchor, -1, 'the revert tool is registered under its name')
+  const schema = new Function(`return (${objectLiteralAfter(src, src.indexOf('schema: {', anchor))})`)()
+  assert.equal(schema.additionalProperties, false, 'the output contract stays strict (no blanket relaxation)')
+
+  const h = makeLineageCtx()
+  const sandboxDir = fileURLToPath(new URL('.', h.ctx.baseUrl))
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 4 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  // Single-operation revert: mode 'op'.
+  const opPath = join(sandboxDir, 'revert-op.txt')
+  recordEdit(h, root, opPath, 'a\n', 'b\n')
+  const opValue = rpcValue(await rpcCall(channel, 'revert', { session: root.id, path: opPath, op: 0 }))
+  assert.equal(opValue.mode, 'op', 'a targeted operation reports the op scope')
+  assert.equal(readFileSync(opPath, 'utf8'), 'a\n', 'the pre-edit content is restored')
+
+  // Whole-file revert: mode 'file'.
+  const filePath = join(sandboxDir, 'revert-file.txt')
+  recordEdit(h, root, filePath, 'x\n', 'y\n')
+  const fileValue = rpcValue(await rpcCall(channel, 'revert', { session: root.id, path: filePath, op: null }))
+  assert.equal(fileValue.mode, 'file', 'a whole-file revert reports the file scope')
+  assert.equal(readFileSync(filePath, 'utf8'), 'x\n')
+
+  // Failure replies travel through the same schema (record already consumed).
+  const failValue = rpcValue(await rpcCall(channel, 'revert', { session: root.id, path: filePath, op: null }))
+  assert.equal(failValue.ok, false)
+
+  const validate = await hostOutputValidator()
+  if (!validate) t.diagnostic('no dsh install discoverable: output schema checked structurally only')
+  for (const value of [opValue, fileValue, failValue]) {
+    for (const key of Object.keys(value)) {
+      assert.ok(Object.hasOwn(schema.properties, key), `output schema declares "${key}" (reply: ${JSON.stringify(value)})`)
+    }
+    if (validate) {
+      assert.deepEqual(validate(schema, value, 'value'), [], `host validator accepts ${JSON.stringify(value)}`)
+    }
+  }
+  for (const d of h.disposers) d()
+})
+
 test('locateFragment recovers a fragment line from the before snapshot', () => {
   const file = ['a', 'b', 'c', 'dup', 'e', 'dup', 'g'].join('\n')
   // Exact for the first site, and the count is what tells replace_all apart.
