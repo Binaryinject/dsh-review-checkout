@@ -1,13 +1,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, realpathSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync, realpathSync, utimesSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
-import { apply, isLoopbackRequest, inject, launchEditor, locateFragment, fontFamiliesFromRegistry, fontFamiliesFromRegistryName, fontFamiliesFromFcList } from '../lib/index.js'
+import { apply, isLoopbackRequest, inject, launchEditor, loadShards, locateFragment, fontFamiliesFromRegistry, fontFamiliesFromRegistryName, fontFamiliesFromFcList, readBlob, readPluginSettings, revertTextOf, settingsFilePath, shardNameOf, stateDirPath, writePluginSettings, ZH_THINKING_BLOCK } from '../lib/index.js'
 
 /** Sandboxed profile dir per test, so flushes never touch real user data.
  *  The trailing slash matters: a backslash encodes to %5C (a plain character,
@@ -18,7 +18,12 @@ function sandboxBaseUrl() {
   const dir = mkdtempSync(join(tmpdir(), 'drv-smoke-'))
   return { dir, url: pathToFileURL(dir + '/').href }
 }
-const tmpDirs = []
+// Hermetic harness home: the plugin also looks for the pre-profile-split state
+// file under $DSH_HOME (profiles/web/diff-review-state.json), so a test run must
+// never read — let alone import — the developer's real one.
+const TEST_DSH_HOME = mkdtempSync(join(tmpdir(), 'drv-home-'))
+process.env.DSH_HOME = TEST_DSH_HOME
+const tmpDirs = [TEST_DSH_HOME]
 function track(dir) { tmpDirs.push(dir); return dir }
 
 /** Extract one named function from the shipped client bundle for behavior tests. */
@@ -40,8 +45,10 @@ function clientFunction(name) {
   return new Function(`${source.slice(start, end)}; return ${name}`)()
 }
 
-/** Minimal Cordis ctx with an official-shape webServer. */
-function makeCtx({ withWebServer = true } = {}) {
+/** Minimal Cordis ctx with an official-shape webServer. `sessionStore` and
+ *  `workspaceRegistry` are the two extra faces the path fence resolves a session's
+ *  cwd through when no live agent exists. */
+function makeCtx({ withWebServer = true, sessionStore = null, workspaceRegistry = null } = {}) {
   const listeners = new Map()
   const disposers = []
   const routes = []
@@ -79,6 +86,8 @@ function makeCtx({ withWebServer = true } = {}) {
     get(name) {
       if (name === 'agents') return agents
       if (name === 'webServer') return webServerOn ? webServer : undefined
+      if (name === 'sessions') return sessionStore || undefined
+      if (name === 'workspaceRegistry') return workspaceRegistry || undefined
       return undefined
     },
     // Cordis semantics: a dependent fiber body runs once every injected
@@ -332,10 +341,40 @@ function recordEdit(h, agent, path, oldString, newString) {
   )
 }
 
-/** Dispose the plugin (flushes the state synchronously) and read it back. */
+/** Dispose the plugin and replay the session shards it wrote into the sandbox
+ *  profile, in the shape the pre-v7 single file had, so the assertions below keep
+ *  reading one object (`state.sessions[sid].files[path].ops`). */
 function flushedState(h) {
   for (const d of h.disposers) d()
-  return JSON.parse(readFileSync(new URL('diff-review-state.json', h.ctx.baseUrl), 'utf8'))
+  const dir = new URL('diff-review-state/', h.ctx.baseUrl)
+  const out = { sessions: {} }
+  let names = []
+  try { names = readdirSync(fileURLToPath(dir)) } catch (e) { return out }
+  for (const name of names.sort()) {
+    if (!name.endsWith('.jsonl')) continue
+    let sid = null
+    const files = {}
+    for (const raw of readFileSync(new URL(name, dir), 'utf8').split('\n')) {
+      if (raw.trim() === '') continue
+      const rec = JSON.parse(raw)
+      if (rec.sid !== undefined) { sid = rec.sid; continue }
+      if (rec.t === 'clear') { for (const key of Object.keys(files)) delete files[key]; continue }
+      if (typeof rec.n === 'number') {
+        const entry = files[rec.p]
+        if (!entry) continue
+        if (rec.n <= 0) delete files[rec.p]
+        else {
+          entry.ops = entry.ops.slice(0, rec.n)
+          if (entry.ops.length === 0) delete files[rec.p]
+        }
+        continue
+      }
+      if (!files[rec.p]) files[rec.p] = { path: rec.p, cwd: rec.c, ops: [] }
+      files[rec.p].ops.push(rec.o)
+    }
+    if (sid) out.sessions[sid] = { files }
+  }
+  return out
 }
 
 test('subagent writes surface in the parent session view via durable parentSession lineage', async () => {
@@ -604,6 +643,7 @@ test('client surfaces and the host aggregate agree on a parent+subagent file (no
  *  client bundle in a VM: function components render to plain element trees. */
 function makeReactDouble() {
   const hooks = new Map()
+  const pending = []
   let comp = null
   let idx = 0
   const slot = (fn) => {
@@ -613,6 +653,22 @@ function makeReactDouble() {
   }
   return {
     createElement: (type, props, ...children) => ({ type, props: props || {}, children: children.flat().filter((c) => c != null) }),
+    /** Run the effects queued by the render that just committed. */
+    flushEffects() {
+      while (pending.length) {
+        const fn = pending.shift()
+        fn()
+      }
+    },
+    /** Attach every `ref` in a committed tree to one fake node (or to whatever
+     *  `mountRef(node)` returns), so measuring components have something to read. */
+    attachRefs(tree, mountRef) {
+      if (!tree || typeof tree !== 'object') return
+      if (tree.props && tree.props.ref && typeof tree.props.ref === 'object') {
+        tree.props.ref.current = typeof mountRef === 'function' ? mountRef(tree) : mountRef
+      }
+      for (const ch of tree.children || []) this.attachRefs(ch, mountRef)
+    },
     useState: (init) => {
       const s = slot(comp)
       const i = idx++
@@ -628,7 +684,11 @@ function makeReactDouble() {
       const prev = s.deps[i]
       const changed = !prev || !deps || deps.length !== prev.length || deps.some((d, k) => !Object.is(d, prev[k]))
       s.deps[i] = deps ? [...deps] : undefined
-      if (changed) fn()
+      // Queued, not called: React runs effects after the commit, i.e. after the
+      // component's `ref` props have been attached. Running them mid-render made a
+      // component that measures its own node see `ref.current === null` on the only
+      // pass its deps allow — a harness artefact, not a product behaviour.
+      if (changed) pending.push(fn)
     },
     useRef: (v) => {
       const s = slot(comp)
@@ -663,6 +723,7 @@ function loadRealClient(rpc, opts = {}) {
       setItem() {}, removeItem() {}
     },
     MutationObserver: class { observe() {} disconnect() {} },
+    ResizeObserver: typeof opts.observeResize === 'function' ? class { constructor(cb) { opts.observeResize(cb) } observe() {} disconnect() {} } : undefined,
     AbortController, URL, RegExp,
     document: {
       createElement: () => ({ textContent: '', remove() {} }),
@@ -672,10 +733,15 @@ function loadRealClient(rpc, opts = {}) {
       querySelectorAll: () => [],
       addEventListener() {}, removeEventListener() {}
     },
-    requestAnimationFrame: (fn) => fn()
+    requestAnimationFrame: (fn) => fn(),
+    // The review toolbar polls the record usage on an interval; nothing in a test needs
+    // the timer to fire, and a real interval would keep the process alive.
+    setInterval: () => 0,
+    clearInterval: () => {}
   }
   sandbox.globalThis = sandbox
   sandbox.window = sandbox
+  if (typeof opts.innerHeight === 'number') sandbox.innerHeight = opts.innerHeight
   sandbox.__ModuleLoader__ = {
     load(mod) {
       exports = mod.factory((name) => {
@@ -703,7 +769,7 @@ function loadRealClient(rpc, opts = {}) {
   // slot's kind (0.1.6 turned conversation.chat.turnTail from chain into list).
   const listSlots = new Set(['conversation.chat.turnTail', 'conversation.composer.dock'])
   exports.apply({
-    get: (n) => (n === 'connection' ? conn : n === 'sessions' ? sessionsSvc : undefined),
+    get: (n) => (n === 'connection' ? conn : n === 'sessions' ? sessionsSvc : n === 'remote.session' ? (opts.remoteSession || undefined) : undefined),
     effect: (fn) => { const d = fn(); if (typeof d === 'function') d(); return () => {} },
     slots: {
       inject: (n, cb) => { cb() },
@@ -713,8 +779,7 @@ function loadRealClient(rpc, opts = {}) {
         return () => {}
       }
     },
-    sessions: sessionsSvc,
-    workspaces: opts.workspaces || {}
+    sessions: sessionsSvc
   })
   const slotComp = (name, id) => registered.find((r) => r.def.name === name && (id === undefined || r.def.id === id))
   const render = (el) => {
@@ -723,6 +788,11 @@ function loadRealClient(rpc, opts = {}) {
     React.beginRender(el.type)
     const out = el.type(el.props)
     React.endRender(prev)
+    // React attaches host refs at commit, before effects: the returned tree is
+    // walked first (the floating pill's ref lives on its own `div`), then queued
+    // effects run. `mountRef` decides what a mounted node looks like.
+    if (opts.mountRef !== undefined) React.attachRefs(out, opts.mountRef)
+    React.flushEffects()
     return render(out)
   }
   const collect = (tree, cls, out = []) => {
@@ -1287,13 +1357,13 @@ test('locateFragment matches text, not whole lines (CRLF included)', () => {
   }
 })
 
-test('a snapshot cut by the storage cap still reports REAL lines, and its revert is refused', async () => {
-  // A huge file is stored capped at MAX_CHARS (120000), and the edit here sits
-  // PAST the cut, so the stored snapshot cannot locate it. Recovering the offset
-  // at edit time from the UNTRUNCATED text (lineHint) keeps the gutter on real
-  // file lines — and that same op must never be reverted from the cut snapshot,
-  // because writing 120000 characters back would destroy the rest of the file.
-  // Both halves come from one real ~200 KB Unity prefab that did exactly this.
+test('a snapshot cut by the storage cap keeps its FULL text, so revert restores the whole file', async () => {
+  // A huge file is stored capped at MAX_CHARS (120000), and the edit here sits PAST
+  // the cut, so the stored copy cannot locate it: recovering the offset at edit time
+  // from the UNTRUNCATED text (lineHint) keeps the gutter on real file lines. The
+  // revert used to be refused outright (writing 120000 characters back would destroy
+  // the rest of the file) — now the untruncated text rides along packed, so the
+  // restore is exact and the ONLY thing never written back is a cut head.
   const h = makeLineageCtx()
   const sandboxDir = fileURLToPath(new URL('.', h.ctx.baseUrl))
   const target = join(sandboxDir, 'huge-prefab.txt')
@@ -1318,10 +1388,29 @@ test('a snapshot cut by the storage cap still reports REAL lines, and its revert
   assert.equal(detail.sections[0].lineBase, expectedLine)
   assert.equal(detail.sections[0].hunks.find((x) => x.type === 'add').b, expectedLine, 'the added line carries the real line number')
 
+  const stored = flushedState(h).sessions['session-root'].files[target].ops[0]
+  assert.equal(typeof stored.fbRef, 'string', 'the cut before-side goes into a content-addressed blob')
+  assert.equal(typeof stored.faRef, 'string', 'and so does the after-side')
+  const blobDir = join(stateDirPath(h.ctx), 'blobs')
+  assert.equal(readdirSync(blobDir).filter((f) => f.endsWith('.gz')).length, 2, 'exactly two blobs, one per side')
+  assert.equal(readBlob(stateDirPath(h.ctx), stored.fbRef), before, 'the blob holds the FULL text')
+  assert.equal(readBlob(stateDirPath(h.ctx), stored.faRef), after)
+
+  // …and the shard LINE does not repeat that 190 KB text twice over: the cut copies are
+  // rebuilt from the blob on load (32 MB of a real 35 MB shard was exactly this).
+  const shardPath = join(stateDirPath(h.ctx), shardNameOf('session-root'))
+  assert.ok(readFileSync(shardPath, 'utf8').length < 50000, 'the shard line stays small')
+  const replayed = new Map()
+  const loadStatus = loadShards(replayed, stateDirPath(h.ctx))
+  assert.equal(loadStatus.rebuilt, 1, 'the cut side is rebuilt from its blob at load')
+  const replayedOp = replayed.get('session-root').get(target).ops[0]
+  assert.equal(replayedOp.before.length, 120000, 'rebuilt as the capped copy, like an op recorded in this run')
+  assert.equal(replayedOp.beforeLen, before.length, 'and its recorded length survives, so the card still knows')
+  assert.equal(revertTextOf(replayedOp, 'before'), before, 'a reloaded record can still revert to the whole file')
+
   const resp = rpcValue(await rpcCall(channel, 'revert', { session: root.id, path: target, op: null }))
-  assert.equal(resp.ok, false, 'a cut snapshot is never written back')
-  assert.match(resp.error, /截断/)
-  assert.equal(readFileSync(target, 'utf8'), after, 'the file keeps its full content')
+  assert.equal(resp.ok, true, 'the revert is no longer refused')
+  assert.equal(readFileSync(target, 'utf8'), before, 'and it restores the WHOLE file, not the cut head')
   for (const d of h.disposers) d()
 })
 
@@ -1498,6 +1587,266 @@ test('replace_all edits report every site, and a missing snapshot is marked rela
   const legacyOps = state.sessions['session-root'].files['src/legacy.js'].ops
   assert.equal(legacyOps[0].replaceAll, false)
   assert.equal('before' in legacyOps[0], false, 'a missing snapshot stays undefined')
+})
+
+test('host: the shard log replays to exactly the post-revert state', async () => {
+  // The append-only log has to describe every mutation, not just appends: an
+  // op-level revert writes a trim line, a whole-file revert writes n:0. If the log
+  // and the in-memory buckets ever disagree, a restart shows reverted changes again.
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 2 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const sandbox = fileURLToPath(new URL('.', h.ctx.baseUrl))
+  const keep = join(sandbox, 'keep.txt')
+  const drop = join(sandbox, 'drop.txt')
+  writeFileSync(keep, 'v0\n', 'utf8')
+  writeFileSync(drop, 'v0\n', 'utf8')
+
+  recordWrite(h, root, keep, 'v1\n')
+  recordEdit(h, root, keep, 'v1\n', 'v2\n')
+  recordWrite(h, root, drop, 'gone\n')
+  rpcValue(await rpcCall(channel, 'revert', { session: root.id, path: keep, op: 1 }))
+  rpcValue(await rpcCall(channel, 'revert', { session: root.id, path: drop, op: null }))
+
+  const live = rpcValue(await rpcCall(channel, 'summary', { session: root.id }))
+  const liveShape = live.files.map((f) => [f.path, f.ops]).sort()
+  const replayed = new Map()
+  const dir = stateDirPath(h.ctx)
+  loadShards(replayed, dir)
+  const diskShape = [...replayed.get('session-root').entries()].map(([p, rec]) => [p, rec.ops.length]).sort()
+
+  assert.deepEqual(diskShape, liveShape, 'the log replays to the same records the view serves')
+  assert.deepEqual(diskShape, [[keep, 1]], 'the reverted file keeps one op, the dropped file is gone')
+  for (const d of h.disposers) d()
+})
+
+test('host: clear removes the shard from disk, so a restart cannot resurrect it', async () => {
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 1 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  recordWrite(h, root, 'src/kept.js', 'x\n')
+  const dir = stateDirPath(h.ctx)
+  const shard = join(dir, shardNameOf('session-root'))
+  assert.equal(existsSync(shard), true, 'recording wrote the shard')
+
+  rpcValue(await rpcCall(channel, 'clear', { session: 'session-root' }))
+  assert.equal(existsSync(shard), false, 'the shard file goes with the in-memory bucket')
+  const replayed = new Map()
+  assert.equal(loadShards(replayed, dir).shards, 0)
+  assert.equal(replayed.size, 0, 'a restart starts from nothing, as the user asked')
+  for (const d of h.disposers) d()
+})
+
+test('host: open-at-line works on a card the record arm never saw (open workspace)', async () => {
+  // Measured failure: a profile whose state file was empty served the review view
+  // from transcript-derived cards while the host's record map knew nothing, so the
+  // path fence refused a file sitting inside the user's own project with
+  // 目标路径不在本次会话记录的文件范围内. The second arm fixes that.
+  const h = makeLineageCtx()
+  const workspace = track(mkdtempSync(join(tmpdir(), 'drv-ws-')))
+  h.setLive(agentOf('session-live', { cwd: workspace }, [{ type: 'turn/start', data: { turn: 1 } }]))
+  apply(h.ctx)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+
+  // Nothing recorded in this profile: the record arm has nothing to match.
+  assert.equal(rpcValue(await rpcCall(channel, 'summary', { session: 'session-live' })).files.length, 0)
+
+  // A file the agent only READ — listed in the transcript, never written.
+  const inside = join(workspace, 'src', 'read-only.js')
+  const allowed = rpcValue(await rpcCall(channel, 'open-with-editor', { editor: '__not-installed__', path: inside, line: 12 }))
+  assert.equal(allowed.ok, false)
+  assert.match(String(allowed.error), /未安装或未检测到/, 'the fence let it through; only the editor lookup failed')
+
+  // Outside every open workspace the fence still refuses, before any editor runs.
+  const outside = join(track(mkdtempSync(join(tmpdir(), 'drv-out-'))), 'secret.js')
+  const refused = rpcValue(await rpcCall(channel, 'open-with-editor', { editor: 'vscode', path: outside, line: 1 }))
+  assert.equal(refused.ok, false)
+  assert.equal(refused.error, '目标路径不在本次会话记录的文件范围内')
+
+  // The arm closes with the session: a workspace is only trusted while it is open.
+  h.drop('session-live')
+  const closed = rpcValue(await rpcCall(channel, 'open-with-editor', { editor: '__not-installed__', path: inside, line: 12 }))
+  assert.equal(closed.error, '目标路径不在本次会话记录的文件范围内')
+
+  for (const d of h.disposers) d()
+})
+
+test('host: a fresh profile inherits the pre-split records, so old cards still open', async () => {
+  // The state file used to be written under profiles/web for EVERY profile (the
+  // migration that was supposed to carry those records into a profile compared a
+  // path with itself and never fired), so the desktop profile started empty.
+  const legacy = join(TEST_DSH_HOME, 'profiles', 'web', 'diff-review-state.json')
+  mkdirSync(dirname(legacy), { recursive: true })
+  const workspace = track(mkdtempSync(join(tmpdir(), 'drv-old-ws-')))
+  const oldFile = join(workspace, 'old.js')
+  // Deliberately shaped like an op an older version could have written (a write
+  // with no `content` field): importing a legacy file must not be able to take the
+  // whole review view down with one odd record.
+  writeFileSync(legacy, JSON.stringify({
+    version: 1,
+    savedAt: 1,
+    sessions: {
+      'session-old': { files: { [oldFile]: { path: oldFile, cwd: workspace, ops: [{ kind: 'write', at: 1, turn: 1, before: null, after: 'a\n' }] } } }
+    }
+  }), 'utf8')
+
+  const h = makeLineageCtx()
+  apply(h.ctx) // no live agent anywhere: the open-workspace arm cannot help here
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const summary = rpcValue(await rpcCall(channel, 'summary', { session: 'session-old' }))
+  assert.equal(summary.files.length, 1, 'the legacy record is served from this profile now')
+  const opened = rpcValue(await rpcCall(channel, 'open-with-editor', { editor: '__not-installed__', path: oldFile, line: 3 }))
+  assert.match(String(opened.error), /未安装或未检测到/, 'the record arm let the inherited path through')
+  for (const d of h.disposers) d()
+  rmSync(legacy, { force: true })
+})
+
+test('host: the fence scopes to the clicked session, resolved through the host faces', async () => {
+  // A card can outlive its session's live state: the review tab can be opened for a
+  // session this process never entered as a live Agent. The host then has to place
+  // the clicked file in THAT session's workspace through the session store.
+  const workspace = track(mkdtempSync(join(tmpdir(), 'drv-sess-ws-')))
+  const records = new Map([['session-old', { header: { id: 'session-old', cwd: workspace } }]])
+  const asked = []
+  const h = makeCtx({ sessionStore: { get: (id) => { asked.push(id); return records.get(id) } } })
+  apply(h.ctx)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const inside = join(workspace, 'src', 'never-recorded.js')
+
+  const allowed = rpcValue(await rpcCall(channel, 'open-with-editor', { session: 'session-old', editor: '__not-installed__', path: inside, line: 4 }))
+  assert.match(String(allowed.error), /未安装或未检测到/, 'the session arm let it through')
+
+  // Without a session id the renderer gets nothing extra…
+  const anonymous = rpcValue(await rpcCall(channel, 'open-with-editor', { editor: '__not-installed__', path: inside, line: 4 }))
+  assert.equal(anonymous.error, '目标路径不在本次会话记录的文件范围内')
+
+  // …and naming a session the host has never seen cannot widen the fence either.
+  const unknown = rpcValue(await rpcCall(channel, 'open-with-editor', { session: 'session-nope', editor: '__not-installed__', path: inside, line: 4 }))
+  assert.equal(unknown.error, '目标路径不在本次会话记录的文件范围内')
+
+  for (const d of h.disposers) d()
+})
+
+test('host: a persisted session header places the file for a session that was never loaded', async () => {
+  const workspace = track(mkdtempSync(join(tmpdir(), 'drv-stored-ws-')))
+  const asked = []
+  const h = makeCtx({
+    workspaceRegistry: {
+      readSessionHeader: async (id) => {
+        asked.push(id)
+        return id === 'session-stored' ? { id, cwd: workspace } : undefined
+      }
+    }
+  })
+  apply(h.ctx)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const inside = join(workspace, 'docs', 'read-me.md')
+  const allowed = rpcValue(await rpcCall(channel, 'open-with-editor', { session: 'session-stored', editor: '__not-installed__', path: inside, line: 2 }))
+  assert.match(String(allowed.error), /未安装或未检测到/, 'the persisted header placed the file')
+  assert.deepEqual(asked, ['session-stored'], 'the registry is asked for the named session only')
+  for (const d of h.disposers) d()
+})
+
+test('host: a named session narrows the fence instead of widening it', async () => {
+  const namedWs = track(mkdtempSync(join(tmpdir(), 'drv-named-ws-')))
+  const otherWs = track(mkdtempSync(join(tmpdir(), 'drv-other-ws-')))
+  const h = makeCtx({ sessionStore: { get: (id) => (id === 'session-a' ? { header: { id, cwd: namedWs } } : undefined) } })
+  // A DIFFERENT session is the live one, so the any-open-workspace fallback would
+  // accept otherWs — the named session must take precedence over it.
+  h.agents.list = () => [{ id: 'session-b', session: { id: 'session-b', header: { id: 'session-b', cwd: otherWs } } }]
+  apply(h.ctx)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const foreign = join(otherWs, 'src', 'elsewhere.js')
+
+  const narrowed = rpcValue(await rpcCall(channel, 'open-with-editor', { session: 'session-a', editor: '__not-installed__', path: foreign, line: 1 }))
+  assert.equal(narrowed.error, '目标路径不在本次会话记录的文件范围内', 'another session\u2019s workspace is not reachable through session-a')
+
+  const own = rpcValue(await rpcCall(channel, 'open-with-editor', { session: 'session-b', editor: '__not-installed__', path: foreign, line: 1 }))
+  assert.match(String(own.error), /未安装或未检测到/, 'the session that owns the workspace still opens it')
+  for (const d of h.disposers) d()
+})
+
+test('host: every recorded op carries its own line counts, taken from the untruncated text', async () => {
+  // The card's net diff needs intact endpoint snapshots; MAX_CHARS cuts them on a big
+  // file, and these per-op numbers are what that fallback sums instead.
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 1 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  recordEdit(h, root, 'src/counts.js', 'b\nc\nd', 'b\nX\nd')
+  recordWrite(h, root, 'src/created.js', 'n1\nn2\n')
+  const state = flushedState(h)
+  const edit = state.sessions['session-root'].files['src/counts.js'].ops[0]
+  assert.equal(edit.added, 1, 'the fragment context lines are not counted as changes')
+  assert.equal(edit.removed, 1)
+  const created = state.sessions['session-root'].files['src/created.js'].ops[0]
+  assert.equal(created.added, 3, 'a create counts its content')
+  assert.equal(created.removed, 0)
+  for (const d of h.disposers) d()
+})
+
+test('host: card totals are the turn NET diff, not the sum of fragment lengths', async () => {
+  // Measured: our card read +401 −93 for a turn where the shell's git-based card read
+  // +181 −7. Two causes, both fixed here: every fragment's CONTEXT lines were counted
+  // as changes, and every intermediate edit of a file was counted as its own diff.
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 3 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const cb = h.listeners.get('tools/result')[0]
+  const v1 = ['a', 'b', 'c', 'd', 'e'].join('\n')
+  const v2 = ['a', 'b', 'X', 'd', 'e'].join('\n')
+  const v3 = ['a', 'b', 'Y', 'd', 'e'].join('\n')
+  const edit = (oldString, newString, before, after, agent) => cb(
+    { tool: 'edit', name: 'edit', input: { file_path: 'src/net.js', old_string: oldString, new_string: newString }, agent: agent || root },
+    { value: after === undefined ? {} : { before: before, after: after } }
+  )
+  // Two edits of the same line, each fragment wrapped in two context lines.
+  edit('b\nc\nd', 'b\nX\nd', v1, v2)
+  edit('b\nX\nd', 'b\nY\nd', v2, v3)
+  // A write that overwrites an existing file, and a brand-new one.
+  cb({ tool: 'write', name: 'write', input: { file_path: 'src/over.js', content: v2 }, agent: root }, { value: { before: v1, after: v2 } })
+  cb({ tool: 'write', name: 'write', input: { file_path: 'src/new.js', content: 'n1\nn2\n' }, agent: root }, { value: { before: null, after: 'n1\nn2\n' } })
+  // A legacy record (no snapshot at all): its own file, so the fallback path is what
+  // this file's numbers come from — it still must not count its context lines.
+  cb(
+    { tool: 'edit', name: 'edit', input: { file_path: 'src/legacy.js', old_string: 'b\nc\nd', new_string: 'b\nX\nd' }, agent: root },
+    { value: {} }
+  )
+
+  const turn = rpcValue(await rpcCall(channel, 'turn', { session: 'session-root', turn: 3 }))
+  const byPath = (payload) => Object.fromEntries(payload.files.map((f) => [f.path, f]))
+  const t = byPath(turn)
+  assert.equal(t['src/net.js'].added, 1, 'the turn net-added one line, not six')
+  assert.equal(t['src/net.js'].removed, 1, 'and net-removed one, not six')
+  assert.equal(t['src/net.js'].edits, 2, 'while the activity counter still reports both ops')
+  assert.equal(t['src/over.js'].added, 1, 'an overwrite counts its difference, not the whole file')
+  assert.equal(t['src/over.js'].removed, 1)
+  assert.equal(t['src/new.js'].added, 3, 'a create counts its content')
+  assert.equal(t['src/new.js'].removed, 0)
+  assert.equal(t['src/legacy.js'].added, 1, 'a snapshot-less record falls back to its own line diff')
+  assert.equal(t['src/legacy.js'].removed, 1)
+
+  // The session-wide scope uses the same semantics (first snapshot → last snapshot).
+  const all = byPath(rpcValue(await rpcCall(channel, 'summary', { session: 'session-root' })))
+  assert.equal(all['src/net.js'].added, 1)
+  assert.equal(all['src/net.js'].removed, 1)
+  for (const d of h.disposers) d()
+})
+
+test('client fallback: a fragment\'s context lines are never counted as changes', () => {
+  const opLineCounts = clientFunction('opLineCounts')
+  assert.deepEqual(opLineCounts({ kind: 'edit', oldString: 'b\nc\nd', newString: 'b\nX\nd' }), { added: 1, removed: 1 }, 'context lines on both sides cancel')
+  assert.deepEqual(opLineCounts({ kind: 'edit', oldString: 'a', newString: 'a\nb' }), { added: 1, removed: 0 }, 'an append adds one')
+  assert.deepEqual(opLineCounts({ kind: 'edit', oldString: '', newString: 'a\nb' }), { added: 2, removed: 0 }, 'a pure insertion')
+  assert.deepEqual(opLineCounts({ kind: 'edit', oldString: 'a\nb', newString: '' }), { added: 0, removed: 2 }, 'a pure deletion')
+  assert.deepEqual(opLineCounts({ kind: 'write', content: 'a\nb\n' }), { added: 3, removed: 0 }, 'a write keeps counting its content')
+  assert.deepEqual(opLineCounts(null), { added: 0, removed: 0 })
 })
 
 test('client: open target per section + the per-turn window cutoff', () => {
@@ -1729,7 +2078,7 @@ test('the OS default application opens the file when no editor can take it', asy
     if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } };
     if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } };
     return {};
-  }, { workspaces: { openPath: (p) => { opened.push(p); return Promise.resolve() } } })
+  }, { remoteSession: { openWorkspacePath: (req) => { opened.push(req.path); return Promise.resolve() } } })
   // No turn card is rendered, so no shell opener is captured: preview is unavailable
   // and the default-application route is the only one left.
   const view = c.slotComp('conversation.view', 'review')
@@ -1764,7 +2113,7 @@ test('the OS default application opens the file when no editor can take it', asy
     if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } };
     if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } };
     return {};
-  }, { editor: { id: 'vscode', name: 'VS Code' }, workspaces: { openPath: (p) => { opened2.push(p); return Promise.resolve() } } })
+  }, { editor: { id: 'vscode', name: 'VS Code' }, remoteSession: { openWorkspacePath: (req) => { opened2.push(req.path); return Promise.resolve() } } })
   const view2 = c2.slotComp('conversation.view', 'review')
   let tree2 = null
   for (let i = 0; i < 3; i++) { tree2 = c2.render(view2.Comp({ sessionId: 'session-root' })); await new Promise((r) => setTimeout(r, 60)) }
@@ -1834,7 +2183,7 @@ test('an absolute file path is never joined onto the cwd a second time', async (
     if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } };
     if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } };
     return {};
-  }, { editor: { id: 'vscode', name: 'VS Code' }, workspaces: { openPath: (p) => { opened.push(p); return Promise.resolve() } } })
+  }, { editor: { id: 'vscode', name: 'VS Code' }, remoteSession: { openWorkspacePath: (req) => { opened.push(req.path); return Promise.resolve() } } })
   const view = c.slotComp('conversation.view', 'review')
   let tree = null
   for (let i = 0; i < 3; i++) { tree = c.render(view.Comp({ sessionId: 'session-root' })); await new Promise((r) => setTimeout(r, 60)) }
@@ -1853,6 +2202,7 @@ test('an absolute file path is never joined onto the cwd a second time', async (
   const openedCall = c.calls.filter((x) => x.endpoint === 'open-with-editor')[0]
   assert.ok(openedCall, 'the editor route was asked')
   assert.equal(openedCall.payload.path, 'D:/ws/abs.js', 'the absolute path reaches the host untouched')
+  assert.equal(openedCall.payload.session, 'session-root', 'the session id rides along, so the host can scope its fence')
 })
 
 test('the editor chip shows the shell’s own application icons', async () => {
@@ -1960,6 +2310,64 @@ test('the running pill switches views through the official store action', async 
   pillEl.props.onClick()
   assert.equal(opened.length, 1, 'the click asked the shell for the review view')
   assert.equal(opened[0][0], 'review')
+})
+
+test('the running pill floats centred above the composer, in the shell-level layer', async () => {
+  // The dock slot renders inside the composer strip — on the current desktop shell
+  // that is the status row UNDER the composer, so an in-flow chip sat next to the
+  // context meter instead of above the input. The chip is floated and positioned
+  // from a measured DOM anchor; this test pins both the class and the offset.
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 675, removed: 275, lastTime: 9 }
+  const rpc = async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  }
+  // The composer box: what composerAnchorOf() finds by walking up from the chip.
+  const composer = { getBoundingClientRect: () => ({ top: 600, left: 200, width: 600 }), querySelector: () => ({}), parentElement: null }
+  const mountRef = { parentElement: composer, getBoundingClientRect: () => ({ top: 640 }) }
+  const c = loadRealClient(rpc, { sessionsById: { 'session-root': { running: true, cwd: 'D:/ws' } }, innerHeight: 800, mountRef })
+  // `running` (the pill's gate) is refreshed by the header-actions entry, so boot
+  // through it exactly like the live shell does.
+  c.render(c.slotComp('conversation.session.header.actions').Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+  c.render(c.slotComp('conversation.view', 'review').Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+
+  // The measuring effect sets state during render in this harness, so the floated
+  // form appears on the next pass — exactly how it appears live one frame later.
+  c.render(c.slotComp('conversation.composer.dock').Comp({ sessionId: 'session-root' }))
+  const pillEl = c.render(c.slotComp('conversation.composer.dock').Comp({ sessionId: 'session-root' }))
+  assert.match(pillEl.props.className, /cdx-pill-float/, 'the chip left the dock row')
+  // Field by field: the style object was made inside the VM realm, so a deepEqual
+  // against a test-realm literal compares prototypes too.
+  assert.equal(pillEl.props.style.left, '500px', 'centred on the composer (200 + 600/2)')
+  assert.equal(pillEl.props.style.bottom, '210px', '10px above the composer top (800 - 600 + 10)')
+})
+
+test('the pill stays in the dock row when the shell offers nothing to measure', async () => {
+  // A shell without a composer textarea (or without a DOM at all, as in these
+  // tests) must keep the previous in-flow behaviour instead of throwing.
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 }
+  const c = loadRealClient(async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  }, { sessionsById: { 'session-root': { running: true, cwd: 'D:/ws' } }, innerHeight: 800, mountRef: null })
+  c.render(c.slotComp('conversation.session.header.actions').Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+  c.render(c.slotComp('conversation.view', 'review').Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+  c.render(c.slotComp('conversation.composer.dock').Comp({ sessionId: 'session-root' }))
+  const pillEl = c.render(c.slotComp('conversation.composer.dock').Comp({ sessionId: 'session-root' }))
+  assert.equal(pillEl.props.className, 'cdx-pill', 'unchanged class')
+  assert.equal(pillEl.props.style, undefined, 'no inline offset is invented')
 })
 
 test('the running pill cannot be squeezed into a one-glyph column by the dock row', () => {
@@ -2126,6 +2534,321 @@ test('the plugin takes the turn cards over: official ones hidden, ours marked ap
   assert.equal(card.props['data-changed-files'], undefined, 'and not with the official one')
 })
 
+test('hovering a card row previews the diff in the shell HoverCard — with the plugin palette', async () => {
+  // The official preview primitive would bring the official diff colours with it,
+  // and this plugin's colours are user-configurable (设置 → 修改审查), so the panel
+  // reuses the shell's CONTAINER but draws the rows with our own renderer.
+  const primitives = { HoverCard: (props) => props.anchor }
+  const file = {
+    path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9,
+    sections: [{ kind: 'edit', at: 5, lineExact: true, hunks: [{ type: 'add', a: null, b: 4, text: 'L4' }] }]
+  }
+  const c = loadRealClient(async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'file') return { path: file.path, sections: file.sections }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  }, { primitives })
+  const tail = c.slotComp('conversation.chat.turnTail')
+  const props = { sessionId: 'session-root', turn: { turn: 5 }, seq: 3, openFile: () => {} }
+  c.render(tail.Comp(props))
+  await new Promise((r) => setTimeout(r, 40))
+  const tree = c.render(tail.Comp(props))
+
+  // The harness renders one component level at a time, so the wrapper is found in
+  // the tree rather than by invoking the stub.
+  const findPreview = (node, out = []) => {
+    if (!node || typeof node !== 'object') return out
+    if (node.props && node.props.variant === 'preview') out.push(node)
+    for (const ch of node.children || []) findPreview(ch, out)
+    return out
+  }
+  const preview = findPreview(tree)[0]
+  assert.ok(preview, 'the card row is wrapped in the shell HoverCard')
+  assert.equal(typeof preview.props.openDelayMs, 'number', 'with a hover dwell delay')
+  assert.equal(preview.props.anchor && preview.props.anchor.type, 'button', 'the row itself stays the hover target')
+  assert.equal(preview.props.anchor.props.className, 'cdx-cf-row')
+  assert.ok(preview.props.widthAnchorRef && typeof preview.props.widthAnchorRef === 'object', 'sized from the card element')
+  assert.equal(typeof preview.props.content.type, 'function', 'and hosts our own panel component')
+
+  const panel = c.render(preview.props.content)
+  assert.equal(c.collect(panel, 'cdx-preview')[0] !== undefined, true, 'the panel rendered')
+  const body = c.collect(panel, 'cdx-preview-body')[0]
+  assert.ok(body, 'with a scrollable diff body')
+  const row = c.render(body.children[0])
+  assert.match(row.props.className, /cdx-add/, 'the added line is drawn by our own line renderer')
+  assert.equal(row.props.style.background, '#e6ffec', 'and wears the plugin diff colour, not an official one')
+
+  // The panel must draw with our renderer: the official DiffBlock would drag the
+  // official palette into a preview the user expects to match the review tab.
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  const start = source.indexOf('function RowPreview(')
+  assert.notEqual(start, -1, 'the preview panel is a named component')
+  const panelSrc = source.slice(start, source.indexOf('\n\t\t}', start))
+  assert.match(panelSrc, /CodexLine/, 'the panel draws its diff rows with our own line renderer')
+  assert.equal(/\bDiffBlock\b/.test(panelSrc), false, 'and never with the official diff renderer')
+})
+
+test('a shell without the HoverCard primitive leaves the card rows untouched', async () => {
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 }
+  const c = loadRealClient(async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  })
+  const tail = c.slotComp('conversation.chat.turnTail')
+  const props = { sessionId: 'session-root', turn: { turn: 5 }, seq: 3, openFile: () => {} }
+  c.render(tail.Comp(props))
+  await new Promise((r) => setTimeout(r, 40))
+  const tree = c.render(tail.Comp(props))
+  const list = c.collect(tree, 'cdx-cf-list')[0]
+  assert.equal(list.children[0].type, 'li', 'the row list is unchanged')
+  assert.equal(list.children[0].children[0].type, 'button', 'and the row is a plain button')
+})
+
+test('diff lines never wrap: the diff scrolls horizontally instead', () => {
+  // A wrapped code line reads as two lines, and its continuation no longer lines up
+  // with the gutter — so every diff surface (both review views and the hover preview)
+  // keeps one line per row and scrolls sideways.
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  const rule = (selector) => {
+    // Anchored: `.cdx-preview-body .cdx-line { … }` is a different (later) rule.
+    const found = new RegExp('^\\.' + selector + ' \\{[^}]*\\}', 'm').exec(source)
+    assert.ok(found, '.' + selector + ' rule ships')
+    return found[0]
+  }
+  const line = rule('cdx-line')
+  assert.match(line, /white-space:pre;/, 'a code line stays one line')
+  assert.equal(/pre-wrap/.test(line), false, 'no wrapping')
+  assert.equal(/word-break:break-word/.test(line), false, 'and no forced breaking inside words')
+  assert.match(line, /width:max-content/, 'the row grows to its content width')
+  assert.match(line, /min-width:100%/, 'while still covering the viewport, so the add/del tint spans it')
+  assert.match(rule('cdx-diff'), /overflow-x:auto/, 'the diff body is the horizontal scroller (both review views)')
+  assert.match(rule('cdx-text'), /min-width:max-content/, 'the text cannot be squeezed into wrapping width')
+  assert.match(rule('cdx-preview-body'), /overflow:auto/, 'the hover preview scrolls the same way')
+})
+
+test('host: the turn payload carries a context preview, not just the edit fragment', async () => {
+  // A model edit whose fragment is one line in / one line out gives the preview
+  // nothing to show around the change; the shell's own preview shows ±3 lines from the
+  // file, so the host now ships that full-file diff (trimmed) alongside the sections.
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 2 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  const file = 'src/ctx.js'
+  const before = ['l1', 'l2', 'l3', 'l4', 'l5', 'l6', 'l7', 'l8'].join('\n')
+  const after = before.replace('l5', 'L5')
+  h.listeners.get('tools/result')[0](
+    { tool: 'edit', name: 'edit', input: { file_path: file, old_string: 'l5', new_string: 'L5' }, agent: root },
+    { value: { before: before, after: after } }
+  )
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const item = rpcValue(await rpcCall(channel, 'turn', { session: 'session-root', turn: 2 })).files[0]
+
+  assert.ok(item.preview && Array.isArray(item.preview.rows), 'the preview diff ships with the turn')
+  assert.deepEqual(item.preview.rows.map((r) => r.type), ['ctx', 'ctx', 'ctx', 'del', 'add', 'ctx', 'ctx', 'ctx'])
+  assert.deepEqual(item.preview.rows.filter((r) => r.type === 'ctx').map((r) => r.text), ['l2', 'l3', 'l4', 'l6', 'l7', 'l8'])
+  assert.deepEqual(item.sections[0].hunks.map((x) => x.type), ['del', 'add'], 'while the sections stay fragment-only')
+  // The lazy path (a card whose data came from the local transcript) gets the same
+  // shape from the file endpoint.
+  const detail = rpcValue(await rpcCall(channel, 'file', { session: 'session-root', path: file }))
+  assert.deepEqual(detail.preview.rows.map((r) => r.type), ['ctx', 'ctx', 'ctx', 'del', 'add', 'ctx', 'ctx', 'ctx'])
+  for (const d of h.disposers) d()
+})
+
+test('the hover preview renders the context diff, gaps included', async () => {
+  const preview = { rows: [
+    { type: 'ctx', a: 2, b: 2, text: 'l2' },
+    { type: 'del', a: 3, b: null, text: 'old' },
+    { type: 'add', a: null, b: 3, text: 'new' },
+    { type: 'gap', a: null, b: null, text: '⋯' },
+    { type: 'add', a: null, b: 90, text: 'far' }
+  ], lineExact: true }
+  const file = { path: 'src/ctx.js', name: 'ctx.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 2, removed: 1, lastTime: 9, preview: preview }
+  const c = loadRealClient(async (endpoint) => {
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  }, { primitives: { HoverCard: (props) => props.anchor } })
+  const tail = c.slotComp('conversation.chat.turnTail')
+  const props = { sessionId: 'session-root', turn: { turn: 5 }, seq: 3, openFile: () => {} }
+  c.render(tail.Comp(props))
+  await new Promise((r) => setTimeout(r, 40))
+  const tree = c.render(tail.Comp(props))
+  const findPreview = (node, out = []) => {
+    if (!node || typeof node !== 'object') return out
+    if (node.props && node.props.variant === 'preview') out.push(node)
+    for (const ch of node.children || []) findPreview(ch, out)
+    return out
+  }
+  const panel = c.render(findPreview(tree)[0].props.content)
+  const body = c.collect(panel, 'cdx-preview-body')[0]
+  const rendered = body.children.map((ch) => c.render(ch))
+  assert.equal(rendered.length, 5, 'one element per preview row')
+  assert.match(rendered[0].props.className, /cdx-line/, 'the context line is drawn by the line renderer')
+  assert.equal(rendered[0].children[0].children[0], '2', 'with its real file line number')
+  assert.match(rendered[1].props.className, /cdx-del/)
+  assert.match(rendered[2].props.className, /cdx-add/)
+  assert.equal(c.collect(panel, 'cdx-preview-gap')[0].children[0], '⋯', 'the skipped region is marked')
+  assert.match(rendered[4].props.className, /cdx-add/)
+})
+
+test('host: clearing a session drops its shard and collects the blobs it orphaned', async () => {
+  // "清空本会话的修改记录" deletes the shard file; the blobs that shard referenced are
+  // orphans from then on, so the endpoint collects them right away instead of waiting for
+  // the next start (GC still respects the grace window that protects another process).
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 6 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  const file = 'src/big.js'
+  const before = Array.from({ length: 3000 }, (_, i) => 'const v' + i + ' = ' + i + ';').join('\n')
+  const after = before.replace('const v0 = 0;', 'const v0 = 42;')
+  h.listeners.get('tools/result')[0](
+    { tool: 'edit', name: 'edit', input: { file_path: file, old_string: 'const v0 = 0;', new_string: 'const v0 = 42;' }, agent: root },
+    { value: { before, after } }
+  )
+  const sd = stateDirPath(h.ctx)
+  const blobDir = join(sd, 'blobs')
+  const shardPath = join(sd, shardNameOf('session-root'))
+  assert.ok(readdirSync(blobDir).length >= 2, 'the two sides went to blobs')
+  assert.ok(existsSync(shardPath))
+  // Age them past the grace window (it exists for a concurrently running process).
+  for (const name of readdirSync(blobDir)) utimesSync(join(blobDir, name), new Date(0), new Date(0))
+
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const res = rpcValue(await rpcCall(channel, 'clear', { session: 'session-root' }))
+  assert.equal(res.ok, true)
+  assert.equal(existsSync(shardPath), false, 'the shard is gone')
+  assert.equal(readdirSync(blobDir).length, 0, 'and so are its blobs')
+  assert.ok(res.blobsRemoved >= 2, 'the endpoint reports what it collected')
+  for (const d of h.disposers) d()
+})
+
+test('host: a big complete snapshot lives in a blob and is rebuilt on load', async () => {
+  // Not about the 120k cap: a 55 KB file is never truncated, yet it used to cost ~110 KB
+  // of shard per edit (twice that for before+after). Big sides go to a blob now.
+  const h = makeLineageCtx()
+  const root = agentOf('session-root', {}, [{ type: 'turn/start', data: { turn: 4 } }])
+  h.setLive(root)
+  apply(h.ctx)
+  const file = 'src/big.js'
+  const before = Array.from({ length: 3000 }, (_, i) => 'const v' + i + ' = ' + i + ';').join('\n')
+  const after = before.replace('const v0 = 0;', 'const v0 = 42;')
+  assert.ok(before.length > 32 * 1024 && before.length < 120000, 'the fixture is big but never truncated')
+  h.listeners.get('tools/result')[0](
+    { tool: 'edit', name: 'edit', input: { file_path: file, old_string: 'const v0 = 0;', new_string: 'const v0 = 42;' }, agent: root },
+    { value: { before, after } }
+  )
+  const stored = flushedState(h).sessions['session-root'].files[file].ops[0]
+  assert.equal(typeof stored.fbRef, 'string', 'the whole text goes to a blob')
+  assert.equal(typeof stored.faRef, 'string')
+  assert.equal(stored.beforeLen, undefined, 'and it was never cut')
+
+  const shardPath = join(stateDirPath(h.ctx), shardNameOf('session-root'))
+  assert.ok(readFileSync(shardPath, 'utf8').length < 8000, 'the shard line stays tiny')
+
+  const replayed = new Map()
+  const status = loadShards(replayed, stateDirPath(h.ctx))
+  assert.equal(status.rebuilt, 1, 'both sides are rebuilt from their blobs')
+  const op = replayed.get('session-root').get(file).ops[0]
+  assert.equal(op.before, before, 'rebuilt byte for byte — nothing was capped')
+  assert.equal(op.after, after)
+  assert.equal(revertTextOf(op, 'before'), before, 'and revert still gets the whole file')
+  for (const d of h.disposers) d()
+})
+
+test('host: the Chinese-thinking rule is injected by default, and the switch persists', async () => {
+  // 默认开启：插件加载就往全局 AGENTS.md 写一段带标记的"用简体中文思考"规则。
+  const file = join(TEST_DSH_HOME, 'AGENTS.md')
+  rmSync(file, { force: true })
+  const h = makeLineageCtx()
+  apply(h.ctx)
+  assert.ok(existsSync(file), 'AGENTS.md is created on first load')
+  assert.ok(readFileSync(file, 'utf8').includes(ZH_THINKING_BLOCK))
+
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  let status = rpcValue(await rpcCall(channel, 'thinking', {}))
+  assert.equal(status.enabled, true, 'on by default')
+  assert.equal(status.injected, true)
+  assert.equal(status.path, file)
+
+  // Switch it off: our paragraph goes away and the choice is written down.
+  const off = rpcValue(await rpcCall(channel, 'thinking-set', { enabled: false }))
+  assert.equal(off.ok, true)
+  assert.equal(off.enabled, false)
+  assert.equal(existsSync(file), false, 'the file we created is removed again')
+  assert.equal(readPluginSettings(stateDirPath(h.ctx)).zhThinking, false, 'the choice is persisted host-side')
+
+  // A restart that reads that setting must NOT re-inject, and turning it back on must.
+  const h2 = makeLineageCtx()
+  writePluginSettings(stateDirPath(h2.ctx), { zhThinking: false })
+  apply(h2.ctx)
+  assert.equal(existsSync(file), false, 'a restart honours the saved "off"')
+  const channel2 = h2.routes.find((r) => r.path === '/diff-review')
+  const on = rpcValue(await rpcCall(channel2, 'thinking-set', { enabled: true }))
+  assert.equal(on.enabled, true)
+  assert.ok(readFileSync(file, 'utf8').includes(ZH_THINKING_BLOCK), 'turning it on injects again')
+  assert.equal(readPluginSettings(stateDirPath(h2.ctx)).zhThinking, true)
+  for (const d of h.disposers) d()
+  for (const d of h2.disposers) d()
+})
+
+test('host: an equivalent rule the user wrote themselves is not duplicated', async () => {
+  const file = join(TEST_DSH_HOME, 'AGENTS.md')
+  const mine = '# 语言规则\n\n- 默认始终使用简体中文进行思考（reasoning）。\n'
+  writeFileSync(file, mine, 'utf8')
+  const h = makeLineageCtx()
+  apply(h.ctx)
+  assert.equal(readFileSync(file, 'utf8'), mine, 'their file is left exactly as it was')
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const status = rpcValue(await rpcCall(channel, 'thinking', {}))
+  assert.equal(status.enabled, true)
+  assert.equal(status.injected, false)
+  assert.equal(status.equivalent, true, 'the settings page can say "already there"')
+  rmSync(file, { force: true })
+  for (const d of h.disposers) d()
+})
+
+test('settings expose the Chinese-thinking switch, on by default', async () => {
+  let state = { ok: true, enabled: true, path: 'C:/x/.dsh/AGENTS.md', injected: false, equivalent: true }
+  const calls = []
+  const c = loadRealClient(async (endpoint, payload) => {
+    calls.push(endpoint)
+    if (endpoint === 'thinking') return state
+    if (endpoint === 'thinking-set') {
+      state = Object.assign({}, state, { enabled: payload.enabled === true, injected: payload.enabled === true, equivalent: false })
+      return state
+    }
+    return {}
+  })
+  const section = c.slotComp('settings.section', 'diff-review')
+  assert.ok(section, 'the settings section registered')
+  c.render(section.Comp({}))
+  await new Promise((r) => setTimeout(r, 30))
+  let tree = c.render(section.Comp({}))
+  let box = c.collect(tree, 'drv-thinking-toggle')[0]
+  assert.ok(box, 'the injection switch renders')
+  assert.equal(box.props.checked, true, 'on by default')
+  assert.match(c.collect(tree, 'drv-settings-hint')[0].children[0], /无需重启/, 'the hint answers "does this need a restart?"')
+  box.props.onChange({ target: { checked: false } })
+  await new Promise((r) => setTimeout(r, 30))
+  tree = c.render(section.Comp({}))
+  box = c.collect(tree, 'drv-thinking-toggle')[0]
+  assert.equal(box.props.checked, false, 'unchecking turns it off')
+  assert.ok(calls.includes('thinking-set'), 'and tells the host')
+})
+
 test('settings can hand the shell cards back', async () => {
   const c = loadRealClient(async () => ({}))
   const section = c.slotComp('settings.section', 'diff-review')
@@ -2147,6 +2870,44 @@ test('the split divider clamps the file list so neither pane collapses', () => {
   assert.equal(clampListWidth(800, 900, 140, 260), 640, 'the diff keeps its share (900 - 260)')
   assert.equal(clampListWidth(400, 0, 140, 260), 400, 'an unknown pane width enforces only the floor')
   assert.equal(clampListWidth(NaN, 900, 140, 260), 140, 'a broken drag lands on the floor')
+})
+
+test('the review toolbar shows the record size and clears the records from there', async () => {
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 }
+  const calls = []
+  const c = loadRealClient(async (endpoint) => {
+    calls.push(endpoint)
+    if (endpoint === 'usage') {
+      return { ok: true, shard: 22 * 1024 * 1024, blobs: 3.1 * 1024 * 1024, blobCount: 107, total: 25.1 * 1024 * 1024, files: 6, ops: 294 }
+    }
+    if (endpoint === 'clear') return { ok: true, blobsRemoved: 107 }
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  })
+  const view = c.slotComp('conversation.view', 'review')
+  c.render(view.Comp({ sessionId: 'session-root' }))
+  await new Promise((r) => setTimeout(r, 40))
+  let tree = c.render(view.Comp({ sessionId: 'session-root' }))
+  const usage = c.collect(tree, 'cdx-usage')[0]
+  assert.ok(usage, 'the toolbar reports the record size')
+  assert.equal(usage.children[0], '25 MB', 'human readable')
+  assert.match(usage.props.title, /分片 22 MB/, 'and says what it is made of')
+  const button = c.collect(tree, 'cdx-clear-btn')[0]
+  assert.ok(button, 'the clear button lives here now')
+  button.props.onClick()
+  await new Promise((r) => setTimeout(r, 20))
+  assert.ok(calls.includes('clear'), 'clicking it clears the session records')
+})
+
+test('the settings page no longer carries the clear button', async () => {
+  const c = loadRealClient(async () => ({}))
+  const section = c.slotComp('settings.section', 'diff-review')
+  const tree = c.render(section.Comp({}))
+  assert.equal(c.collect(tree, 'drv-danger-btn').length, 0, 'clearing moved to the review toolbar')
 })
 
 test('the review split view has a draggable divider that resizes the file list', async () => {

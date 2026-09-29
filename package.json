@@ -1,6 +1,6 @@
 {
   "name": "dsh-review-checkout",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "description": "File-change review for DeepSeek Harness sessions: per-turn change cards styled like the official deliverables card with one-click per-turn revert, a turn-scoped review tab (draggable split diff, syntax highlighting, real line numbers), and a three-step open chain (chosen editor at the line -> OS default app -> built-in preview).",
   "type": "module",
   "main": "lib/index.js",
@@ -28,7 +28,6 @@
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-ui-conversation",
         "@deepseek-ai/dsh-client-ui-primitives",
@@ -52,7 +51,7 @@
   ],
   "license": "MIT",
   "scripts": {
-    "test": "node --test",
+    "test": "node --test \"test/*.test.js\"",
     "sync": "node scripts/sync-profile.mjs"
   },
   "repository": {
