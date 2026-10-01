@@ -142,6 +142,16 @@ docs/open-fence-empty-state-diagnosis.md  「目标路径不在本次会话记�
 
 ## 更新日志
 
+### 1.0.1
+
+行为不变的清理版：只删死代码与重复实现，不改任何可观察行为（135 条测试全绿，与 1.0.0 基线一致），两个源文件净减 149 行。
+
+- **删掉不可达的自定义 tooltip 机制**：`showTip` 只被 `Tip` 调用，而 `Tip` 从未被创建，`store.tip` 恒为 `null`、`TipLayer` 恒返回 `null`（连同一个永不触发的 `setTimeout` 与 `.drv-tip*` 样式）。
+- **删掉死函数与死样式**：`windowSummary()` 全文件零引用；CSS 里 62 行旧审查视图（`.drv-*` 文件列表/详情/轮次卡片/右键菜单）与已下线的「记录占用条」（`.cdx-bar*`）规则从没有任何 `className` 引用。
+- **删掉只写不读的状态**：`store.mode` 全仓唯一读点就是那个恒为真的 `if (store.mode === "latest")`；以及 `ChangePill` 里同一 selector 的重复订阅。
+- **收敛重复判据**：未调用也未导出的 `truncatedSnapshot` 删除，`revertTextOf` / `unrecoverableCut` 里逐字相同的「截断侧」判定合并为 `isCutSide`（撤回安全判据不再有三份拷贝）；`handleRpc` 的 `body.session` 归一化、`buildSummary` 的 `latestTurn`、编辑/写入两个分支的相同尾部各只保留一份。
+- **顺手的小优化**：语法高亮的关键词正则按语言预编译一次（原先每个标识符都 `new RegExp`），并修掉两处被自动编辑挤在同一行的格式。
+
 ### 1.0.0
 
 首个正式版（0.9.1 的开发内容没有单独发布，一并在这一版里）。
