@@ -142,6 +142,14 @@ docs/open-fence-empty-state-diagnosis.md  「目标路径不在本次会话记�
 
 ## 更新日志
 
+### 1.0.2
+
+在 1.0.1（行为不变的清理版）之上，修掉 DeepSeek Harness 44.x / client 0.2.1-rc.5 里暴露的问题。
+
+- **修复 DSH 客户端 44.x 里审查 tab 整条消失**：新版 shell 把 View tab 的 `label` 当**文本**投影（`string | (() => string)`，并按字符串逐字估宽），而插件返回的是 React 元素——渲染 tab 行时抛 `label is not iterable`，整行 tab（连「对话」）一起没了。label 改为常量字符串「审查」，tab 上**不再挂数量**（计数看输入框上方的胶囊和审查面板）；点击/选中判断改为按文案找按钮（44.x 的 tab 不再带插件自己的 DOM 标记）。
+- **修复轮次进行中审查 tab 反复「加载中…」与文件列表闪烁**：5 秒轮询原本每个 tick 提交两次列表（先转录解析、再宿主 summary），React 每次拿到新数组就整表重绘、并连带重跑轮次加载 effect（还重复发一次 turn 请求）；现在一个 tick 只提交**一次**、且内容没变就**完全不提交**（`sameFileRows` / `samePayload` 结构比较），轮次载荷同理；进 tab 或切回会话时只有列表为空才显示「加载中…」，已有数据静默刷新。
+- **按 44.x 重新审计全部扩展点**：槽位选项、owner props、`inject` 服务、官方原语、主题属性、宿主 RPC 与 webServer 路由逐项核对（结论与复核命令见 [docs/dsh-44-client-audit.md](docs/dsh-44-client-audit.md)）；顺带删掉 `sidebar.footer.action` 的空占位注册。
+
 ### 1.0.0
 
 首个正式版（0.9.1 的开发内容没有单独发布，一并在这一版里）。
