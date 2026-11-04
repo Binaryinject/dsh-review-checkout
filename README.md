@@ -142,6 +142,10 @@ docs/open-fence-empty-state-diagnosis.md  「目标路径不在本次会话记�
 
 ## 更新日志
 
+### 1.0.3
+
+- **修复 1.0.2 的发布缺陷（插件整个不加载）**：1.0.2 的 `package.json` 被写成了带 UTF-8 BOM 的文件。DSH 的 `readProfileManifest` 是 `JSON.parse(readFileSync(path, "utf8"))`（不 strip BOM），于是抛 `Unexpected token '﻿'`，`loadProfileDirectory` 把整个 bundle 记进 `skippedBundles` 跳过 —— host 侧连 `apply` 都不执行，客户端自然没有任何 tab，表现为会话头部整条 tab 消失。本版以无 BOM 的 UTF-8 重新打包，并在发布前校验包内每个文件的首字节。
+
 ### 1.0.2
 
 在 1.0.1（行为不变的清理版）之上，修掉 DeepSeek Harness 44.x / client 0.2.1-rc.5 里暴露的问题。
