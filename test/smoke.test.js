@@ -855,7 +855,10 @@ test('client bundle wiring: host data drives badge + list, empty host falls back
       tree = c.render(view.Comp({ sessionId: 'session-root' }))
       await settle()
     }
-    const badge = c.collect(c.render(view.def.label()), 'drv-tab-badge')[0]
+    // 44.x projects the tab label as TEXT (`label: string | (() => string)`); ours is
+    // a constant, and the count deliberately stays off the tab.
+    const rawLabel = view.def.label
+    const labelText = String(typeof rawLabel === 'function' ? rawLabel() : rawLabel)
     // The session-wide list lives in the 'all' ("全部修改") scope; the default
     // turn scope shows only the requested turn's payload.
     const select = c.collect(tree, 'cdx-turn-select')[0]
@@ -864,30 +867,28 @@ test('client bundle wiring: host data drives badge + list, empty host falls back
       select.props.onChange({ target: { value: 'all' } })
       allTitles = c.collect(c.render(view.Comp({ sessionId: 'session-root' })), 'cdx-fl-item').map((r) => r.props.title)
     }
-    return { c, tree, badge: badge && badge.children[0], allTitles }
+    return { c, tree, labelText, allTitles }
   }
 
   // 3 host files, one of which the parent also touched, plus a transcript-only
-  // path the host never saw. Union per path: 4 rows, never a duplicate row, and
-  // the badge is the same number the panel shows.
+  // path the host never saw. Union per path: 4 rows, never a duplicate row.
   const host = await boot([sub(1), sub(2), sub(3)], [sub(1), sub(2), sub(3)])
   assert.deepEqual(host.c.collect(host.tree, 'cdx-fl-item').map((r) => r.props.title), ['sub-1.js', 'sub-2.js', 'sub-3.js'], 'turn scope shows the turn payload')
   assert.equal(host.allTitles.filter((t) => t === 'sub-1.js').length, 1, 'a parent+subagent file is one row, not two')
   assert.deepEqual(host.allTitles.slice().sort(), ['local-only.js', 'sub-1.js', 'sub-2.js', 'sub-3.js'], 'host rows win per path; a transcript-only path is kept')
-  assert.equal(host.badge, '4', 'badge === list length (the tab and the panel agree)')
+  assert.equal(host.labelText, '审查', 'the tab label is constant text; the count stays off the tab')
   assert.equal(host.c.calls.some((x) => x.endpoint === 'summary'), true, 'the existing summary endpoint is used')
 
   // Same expectations through the OFFICIAL Web transport face, where rpc.call
   // resolves with { ok: true, value } — the production shape that the original
   // bare-payload bug hid. This is the envelope integration the fix relies on.
   const enveloped = await boot([sub(1), sub(2), sub(3)], [sub(1), sub(2), sub(3)], true)
-  assert.equal(enveloped.badge, host.badge, 'badge identical when the transport returns the official envelope')
+  assert.equal(enveloped.labelText, host.labelText, 'label identical when the transport returns the official envelope')
   assert.deepEqual(enveloped.allTitles.slice().sort(), host.allTitles.slice().sort(), 'list identical with the official envelope')
 
-  // Host empty -> the local parse only (behavior identical to before): the
-  // transcript's two files are both in the latest turn, so the badge is 2.
+  // Host empty -> the local parse only (behavior identical to before).
   const local = await boot([], [])
-  assert.equal(local.badge, '2', 'badge falls back to the local window')
+  assert.equal(local.labelText, '审查', 'label stays constant with the local fallback too')
   assert.deepEqual(local.allTitles.slice().sort(), ['local-only.js', 'sub-1.js'], 'list is the local parse')
 })
 
@@ -1145,6 +1146,22 @@ test('client unwraps the official RPC envelope and tolerates bare payloads', () 
   assert.deepEqual(hostValueOf({ ok: false, error: '编辑器未安装' }), { ok: false, error: '编辑器未安装' })
   // Transport-level failure carries the contract-shaped error record.
   assert.throws(() => hostValueOf({ ok: false, error: { code: 'x', message: 'boom', details: {} } }), /boom/)
+})
+
+test('an unchanged poll tick commits nothing (no list flicker while a turn runs)', () => {
+  // Every tick used to hand React a fresh `files` array (transcript parse first,
+  // host summary second), so the list repainted twice a poll and the turn-loader
+  // effect re-ran with it. A tick now commits once, and only when a row moved.
+  const sameFileRows = clientFunction('sameFileRows')
+  const samePayload = clientFunction('samePayload')
+  const rows = [{ path: 'a.js', added: 1, removed: 2, ops: 3, writes: 1, edits: 2 }]
+  const clone = rows.map((r) => ({ ...r }))
+  assert.equal(sameFileRows(rows, clone), true, 'a structurally identical list is unchanged')
+  assert.equal(sameFileRows(rows, []), false, 'a shorter list is a change')
+  assert.equal(sameFileRows(rows, [{ ...rows[0], added: 2 }]), false, 'a moved count is a change')
+  assert.equal(samePayload({ turn: 7, files: rows }, { turn: 7, files: clone }), true, 'identical turn payload')
+  assert.equal(samePayload({ turn: 7, files: rows }, { turn: 8, files: clone }), false, 'a new turn is a change')
+  assert.equal(samePayload(null, null), true, 'no payload twice stays unchanged')
 })
 
 test('tab badge keeps the host latest-activity window across a fresh turn', () => {
@@ -2285,12 +2302,15 @@ test('editor probing runs once, not on every review-tab visit', async () => {
   assert.equal(editorCalls.length, 2, 'the re-probe entry asks the host again')
 })
 
-test('the review tab label exposes the stable selector the pill clicks', () => {
+test('the review tab label is plain text the shell can measure and project', () => {
   const c = loadRealClient(async () => ({}))
   const def = c.slotComp('conversation.view', 'review').def
-  const label = c.render(def.label())
-  assert.equal(label.props['data-dsh-view'], 'review', 'the label anchors the DOM fallback')
-  assert.equal(c.collect(label, 'drv-tab-label').length, 1)
+  const raw = def.label
+  const label = typeof raw === 'function' ? raw() : raw
+  // UI 44.x sizes every View tab with `for (const glyph of label)`; a React element
+  // here throws inside the tab row and the whole strip disappears.
+  assert.equal(typeof label, 'string', 'label must be text, never a React element')
+  assert.equal(label, '审查', 'the tab reads 审查, with no count attached')
 })
 
 test('the running pill switches views through the official store action', async () => {

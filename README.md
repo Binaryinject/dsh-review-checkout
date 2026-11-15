@@ -145,6 +145,32 @@ docs/open-fence-empty-state-diagnosis.md  「目标路径不在本次会话记�
 
 ## 更新日志
 
+### 1.0.4
+
+适配 DSH 0.2（桌面版 0.2.2-rc.3 / client 0.2.x）；包含 1.0.2 / 1.0.3 的全部修复。
+
+- **胶囊换到官方座位**：注册从 `conversation.composer.dock`（输入框**下方**的状态行）改到 `conversation.input.dock`（壳自己给「输入框上方的全宽条目」留的座位）。旧实现靠 `position:fixed` + 向上找输入框祖先把胶囊"浮"回输入框上方；新版壳把 docked composer 变成 fixed 的包含块（slot 契约也明确要求 fixed 浮层 portal 到 body），于是胶囊跑到右边、不再悬浮。官方座位是普通文档流行，整套 hack 不再需要。
+- **撤回改为宿主执行**：卡片「撤销」直接调用 `undo-turn`（第一次点击武装、3 秒内再点才执行，防误触），不再把 `diff_review_revert` 指令填进输入框；新增 `/review-undo` 斜杠命令撤回最近一轮。`diff_review_revert` 工具仍保留，并在对话流里有自己的结果行（`tool.call.toolview`）。
+- **审查偏好宿主化**（`prefs` / `prefs-set`）：`ignoreWhitespace`（统计与本地兜底 diff 都按空白不敏感比较）、`hideGitIgnored`（交给 `git check-ignore`，嵌套 .gitignore / info/exclude / 全局 ignore 全部生效）。
+- **「中文思考」改为系统提示词段落**：不再写用户的 `~/.dsh/AGENTS.md`——那份文件以从属的 user 消息到达、且只在会话首步读取，实测不生效；系统提示词每步重建，改完立即生效。
+- **追踪 `str_replace_editor`**（create / str_replace / insert）：它的结果只有一句成功文本，故改动前快照在 `tools/pre-execute` 抓取。
+- **路径围栏**：先解析被点击会话自己的工作区，再退回本进程已打开的工作区，一个 profile 可以打开另一个会话树里的文件。
+- **悬停预览**：用官方 `HoverCard` 原语 + 插件自己的 diff 渲染器，颜色、语法高亮与审查 tab 完全一致；拿不到精确差异时退回按 op 片段渲染。
+- **迁移保护**：超过 64 MiB 的旧单文件状态**原样保留并记录**，不在启动路径上解析（`readFileSync` + `JSON.parse` 上百 MB 会卡住所有会话）。
+- 合并 1.0.2 / 1.0.3：审查 tab 渲染与轮询去抖（dsh-44）、以及 1.0.2 的 BOM 发布缺陷修复。
+
+### 1.0.3
+
+- **修复 1.0.2 的发布缺陷（插件整个不加载）**：1.0.2 的 `package.json` 被写成了带 UTF-8 BOM 的文件。DSH 的 `readProfileManifest` 是 `JSON.parse(readFileSync(path, "utf8"))`（不 strip BOM），于是抛 `Unexpected token '﻿'`，`loadProfileDirectory` 把整个 bundle 记进 `skippedBundles` 跳过 —— host 侧连 `apply` 都不执行，客户端自然没有任何 tab，表现为会话头部整条 tab 消失。本版以无 BOM 的 UTF-8 重新打包，并在发布前校验包内每个文件的首字节。
+
+### 1.0.2
+
+在 1.0.1（行为不变的清理版）之上，修掉 DeepSeek Harness 44.x / client 0.2.1-rc.5 里暴露的问题。
+
+- **修复 DSH 客户端 44.x 里审查 tab 整条消失**：新版 shell 把 View tab 的 `label` 当**文本**投影（`string | (() => string)`，并按字符串逐字估宽），而插件返回的是 React 元素——渲染 tab 行时抛 `label is not iterable`，整行 tab（连「对话」）一起没了。label 改为常量字符串「审查」，tab 上**不再挂数量**（计数看输入框上方的胶囊和审查面板）；点击/选中判断改为按文案找按钮（44.x 的 tab 不再带插件自己的 DOM 标记）。
+- **修复轮次进行中审查 tab 反复「加载中…」与文件列表闪烁**：5 秒轮询原本每个 tick 提交两次列表（先转录解析、再宿主 summary），React 每次拿到新数组就整表重绘、并连带重跑轮次加载 effect（还重复发一次 turn 请求）；现在一个 tick 只提交**一次**、且内容没变就**完全不提交**（`sameFileRows` / `samePayload` 结构比较），轮次载荷同理；进 tab 或切回会话时只有列表为空才显示「加载中…」，已有数据静默刷新。
+- **按 44.x 重新审计全部扩展点**：槽位选项、owner props、`inject` 服务、官方原语、主题属性、宿主 RPC 与 webServer 路由逐项核对（结论与复核命令见 [docs/dsh-44-client-audit.md](docs/dsh-44-client-audit.md)）；顺带删掉 `sidebar.footer.action` 的空占位注册。
+
 ### 1.0.1
 
 行为不变的清理版：只删死代码与重复实现，不改任何可观察行为（135 条测试全绿，与 1.0.0 基线一致），两个源文件净减 149 行。
