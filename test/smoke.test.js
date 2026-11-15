@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
-import { apply, isLoopbackRequest, inject, launchEditor, loadShards, locateFragment, fontFamiliesFromRegistry, fontFamiliesFromRegistryName, fontFamiliesFromFcList, readBlob, readPluginSettings, revertTextOf, settingsFilePath, shardNameOf, stateDirPath, writePluginSettings, ZH_THINKING_BLOCK } from '../lib/index.js'
+import { apply, isLoopbackRequest, inject, launchEditor, loadShards, locateFragment, fontFamiliesFromRegistry, fontFamiliesFromRegistryName, fontFamiliesFromFcList, readBlob, readPluginSettings, revertTextOf, settingsFilePath, shardNameOf, stateDirPath, writePluginSettings, ZH_THINKING_ORDER, ZH_THINKING_RULE, ZH_THINKING_SECTION } from '../lib/index.js'
 
 /** Sandboxed profile dir per test, so flushes never touch real user data.
  *  The trailing slash matters: a backslash encodes to %5C (a plain character,
@@ -66,8 +66,36 @@ function makeCtx({ withWebServer = true, sessionStore = null, workspaceRegistry 
       return () => {}
     }
   }
+  // Minimal systemPrompt registry double: `section()` inserts and returns the exact
+  // disposer the real registry returns, so the switch's register/unregister path is
+  // exercised here rather than only in production.
+  const sections = []
+  const systemPrompt = {
+    section(section) {
+      sections.push(section)
+      return () => {
+        const i = sections.indexOf(section)
+        if (i >= 0) sections.splice(i, 1)
+      }
+    }
+  }
+  // Command registry double: the plugin registers /review-undo through
+  // ctx.inject(['commands'], …), and a test needs the definition to call its handler.
+  const commands = []
+  const commandsService = {
+    register(definition) {
+      commands.push(definition)
+      return () => {
+        const i = commands.indexOf(definition)
+        if (i >= 0) commands.splice(i, 1)
+      }
+    }
+  }
   const ctx = {
     agents,
+    // cordis exposes an injected service as a ctx property; that is how the plugin's
+    // ctx.inject(['commands'], …) callback reaches the registry.
+    commands: commandsService,
     baseUrl: sandboxBaseUrl().url,
     on(event, cb) {
       if (!listeners.has(event)) listeners.set(event, [])
@@ -86,6 +114,8 @@ function makeCtx({ withWebServer = true, sessionStore = null, workspaceRegistry 
     get(name) {
       if (name === 'agents') return agents
       if (name === 'webServer') return webServerOn ? webServer : undefined
+      if (name === 'systemPrompt') return systemPrompt
+      if (name === 'commands') return commandsService
       if (name === 'sessions') return sessionStore || undefined
       if (name === 'workspaceRegistry') return workspaceRegistry || undefined
       return undefined
@@ -106,7 +136,7 @@ function makeCtx({ withWebServer = true, sessionStore = null, workspaceRegistry 
       if (names.every((n) => ctx.get(n) !== undefined)) cb(ctx)
     }
   }
-  return { ctx, listeners, disposers, agents, webServer, routes, activateWebServer }
+  return { ctx, listeners, disposers, agents, webServer, routes, sections, commands, activateWebServer }
 }
 
 test.after(() => {
@@ -169,20 +199,6 @@ test('review jump predicate: applied only when turn scope + file selected + targ
   assert.equal(jumpApplied('turn', 'a.js', 'a.js', 3, 3), true)
   // no jump target at all
   assert.equal(jumpApplied('turn', 'x.js', null, 3, 3), false)
-})
-
-test('revert command builder: per-op newest-first + whole-file fallback + quote escaping', () => {
-  const revertCmdFor = clientFunction('revertCmdFor')
-  const sections = [{ opIndex: 2 }, { kind: 'edit', opIndex: 0 }, { opIndex: 5 }]
-  assert.equal(
-    revertCmdFor('a"b.js', sections),
-    'diff_review_revert(path="a\\"b.js", op=5) → diff_review_revert(path="a\\"b.js", op=2) → diff_review_revert(path="a\\"b.js", op=0)'
-  )
-  // no op indices -> whole-file fallback
-  assert.equal(revertCmdFor('x.js', []), 'diff_review_revert(path="x.js")')
-  assert.equal(revertCmdFor('x.js', [{ kind: 'edit' }]), 'diff_review_revert(path="x.js")')
-  // no path -> no command
-  assert.equal(revertCmdFor('', null), '')
 })
 
 test('focusFile: exactly one card open at a time (mutually exclusive list expansion)', () => {
@@ -2305,52 +2321,18 @@ test('the running pill switches views through the official store action', async 
   c.render(view.Comp(viewProps()))
   assert.equal(acknowledged.length >= 1, true, 'the one-shot view request is acknowledged')
 
-  const pillEl = c.render(c.slotComp('conversation.composer.dock').Comp({ sessionId: 'session-root' }))
+  const pillEl = c.render(c.slotComp('conversation.input.dock').Comp({ sessionId: 'session-root' }))
   assert.ok(pillEl && pillEl.props && pillEl.props.className === 'cdx-pill', 'the pill renders while the session is running')
   pillEl.props.onClick()
   assert.equal(opened.length, 1, 'the click asked the shell for the review view')
   assert.equal(opened[0][0], 'review')
 })
 
-test('the running pill floats centred above the composer, in the shell-level layer', async () => {
-  // The dock slot renders inside the composer strip — on the current desktop shell
-  // that is the status row UNDER the composer, so an in-flow chip sat next to the
-  // context meter instead of above the input. The chip is floated and positioned
-  // from a measured DOM anchor; this test pins both the class and the offset.
-  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 675, removed: 275, lastTime: 9 }
-  const rpc = async (endpoint) => {
-    if (endpoint === 'editors') return { editors: [] }
-    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
-    if (endpoint === 'turn') return { turn: 5, files: [file] }
-    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
-    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
-    return {}
-  }
-  // The composer box: what composerAnchorOf() finds by walking up from the chip.
-  const composer = { getBoundingClientRect: () => ({ top: 600, left: 200, width: 600 }), querySelector: () => ({}), parentElement: null }
-  const mountRef = { parentElement: composer, getBoundingClientRect: () => ({ top: 640 }) }
-  const c = loadRealClient(rpc, { sessionsById: { 'session-root': { running: true, cwd: 'D:/ws' } }, innerHeight: 800, mountRef })
-  // `running` (the pill's gate) is refreshed by the header-actions entry, so boot
-  // through it exactly like the live shell does.
-  c.render(c.slotComp('conversation.session.header.actions').Comp({ sessionId: 'session-root' }))
-  await new Promise((r) => setTimeout(r, 40))
-  c.render(c.slotComp('conversation.view', 'review').Comp({ sessionId: 'session-root' }))
-  await new Promise((r) => setTimeout(r, 40))
-
-  // The measuring effect sets state during render in this harness, so the floated
-  // form appears on the next pass — exactly how it appears live one frame later.
-  c.render(c.slotComp('conversation.composer.dock').Comp({ sessionId: 'session-root' }))
-  const pillEl = c.render(c.slotComp('conversation.composer.dock').Comp({ sessionId: 'session-root' }))
-  assert.match(pillEl.props.className, /cdx-pill-float/, 'the chip left the dock row')
-  // Field by field: the style object was made inside the VM realm, so a deepEqual
-  // against a test-realm literal compares prototypes too.
-  assert.equal(pillEl.props.style.left, '500px', 'centred on the composer (200 + 600/2)')
-  assert.equal(pillEl.props.style.bottom, '210px', '10px above the composer top (800 - 600 + 10)')
-})
-
-test('the pill stays in the dock row when the shell offers nothing to measure', async () => {
-  // A shell without a composer textarea (or without a DOM at all, as in these
-  // tests) must keep the previous in-flow behaviour instead of throwing.
+test('the pill is an ordinary in-flow row in the shell\'s input dock', async () => {
+  // It used to be pulled out of the dock row with position:fixed and positioned from a
+  // measured DOM anchor (composerAnchorOf + ResizeObserver). `conversation.input.dock`
+  // is the shell's own seat for full-width entries ABOVE the composer card, so the chip
+  // is a plain row: no float class, no inline offset, no measurement ref.
   const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 0, edits: 1, added: 1, removed: 0, lastTime: 9 }
   const c = loadRealClient(async (endpoint) => {
     if (endpoint === 'editors') return { editors: [] }
@@ -2359,15 +2341,15 @@ test('the pill stays in the dock row when the shell offers nothing to measure', 
     if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
     if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
     return {}
-  }, { sessionsById: { 'session-root': { running: true, cwd: 'D:/ws' } }, innerHeight: 800, mountRef: null })
+  }, { sessionsById: { 'session-root': { running: true, cwd: 'D:/ws' } } })
   c.render(c.slotComp('conversation.session.header.actions').Comp({ sessionId: 'session-root' }))
   await new Promise((r) => setTimeout(r, 40))
   c.render(c.slotComp('conversation.view', 'review').Comp({ sessionId: 'session-root' }))
   await new Promise((r) => setTimeout(r, 40))
-  c.render(c.slotComp('conversation.composer.dock').Comp({ sessionId: 'session-root' }))
-  const pillEl = c.render(c.slotComp('conversation.composer.dock').Comp({ sessionId: 'session-root' }))
-  assert.equal(pillEl.props.className, 'cdx-pill', 'unchanged class')
+  const pillEl = c.render(c.slotComp('conversation.input.dock').Comp({ sessionId: 'session-root' }))
+  assert.equal(pillEl.props.className, 'cdx-pill', 'the plain in-flow class')
   assert.equal(pillEl.props.style, undefined, 'no inline offset is invented')
+  assert.equal(pillEl.props.ref, undefined, 'no measurement ref')
 })
 
 test('the running pill cannot be squeezed into a one-glyph column by the dock row', () => {
@@ -2768,66 +2750,99 @@ test('host: a big complete snapshot lives in a blob and is rebuilt on load', asy
   for (const d of h.disposers) d()
 })
 
-test('host: the Chinese-thinking rule is injected by default, and the switch persists', async () => {
-  // 默认开启：插件加载就往全局 AGENTS.md 写一段带标记的"用简体中文思考"规则。
-  const file = join(TEST_DSH_HOME, 'AGENTS.md')
-  rmSync(file, { force: true })
+test('host: the Chinese-thinking rule is a system-prompt section, on by default', async () => {
   const h = makeLineageCtx()
   apply(h.ctx)
-  assert.ok(existsSync(file), 'AGENTS.md is created on first load')
-  assert.ok(readFileSync(file, 'utf8').includes(ZH_THINKING_BLOCK))
+  // 默认开启：插件加载即把规则注册成系统提示词的一个段落（不再写 AGENTS.md）。
+  assert.equal(h.sections.length, 1, 'the rule section is registered on load')
+  assert.equal(h.sections[0].name, ZH_THINKING_SECTION)
+  assert.equal(h.sections[0].order, ZH_THINKING_ORDER)
+  assert.equal(h.sections[0].text, ZH_THINKING_RULE)
+  assert.equal(h.sections[0].interpolate, false, 'literal prose, never a template')
 
   const channel = h.routes.find((r) => r.path === '/diff-review')
-  let status = rpcValue(await rpcCall(channel, 'thinking', {}))
+  const status = rpcValue(await rpcCall(channel, 'thinking', {}))
   assert.equal(status.enabled, true, 'on by default')
-  assert.equal(status.injected, true)
-  assert.equal(status.path, file)
+  assert.equal(status.registered, true)
+  assert.equal(status.section, ZH_THINKING_SECTION)
 
-  // Switch it off: our paragraph goes away and the choice is written down.
+  // Switch it off: the section is disposed — the model stops seeing the rule on the very
+  // next step — and the choice is written down host-side.
   const off = rpcValue(await rpcCall(channel, 'thinking-set', { enabled: false }))
   assert.equal(off.ok, true)
   assert.equal(off.enabled, false)
-  assert.equal(existsSync(file), false, 'the file we created is removed again')
+  assert.equal(off.registered, false)
+  assert.equal(h.sections.length, 0, 'the section is gone')
   assert.equal(readPluginSettings(stateDirPath(h.ctx)).zhThinking, false, 'the choice is persisted host-side')
 
-  // A restart that reads that setting must NOT re-inject, and turning it back on must.
+  // A restart that reads that setting must NOT register, and turning it back on must.
   const h2 = makeLineageCtx()
   writePluginSettings(stateDirPath(h2.ctx), { zhThinking: false })
   apply(h2.ctx)
-  assert.equal(existsSync(file), false, 'a restart honours the saved "off"')
+  assert.equal(h2.sections.length, 0, 'a restart honours the saved "off"')
   const channel2 = h2.routes.find((r) => r.path === '/diff-review')
   const on = rpcValue(await rpcCall(channel2, 'thinking-set', { enabled: true }))
   assert.equal(on.enabled, true)
-  assert.ok(readFileSync(file, 'utf8').includes(ZH_THINKING_BLOCK), 'turning it on injects again')
+  assert.equal(on.registered, true)
+  assert.equal(h2.sections.length, 1, 'turning it on registers again')
   assert.equal(readPluginSettings(stateDirPath(h2.ctx)).zhThinking, true)
   for (const d of h.disposers) d()
   for (const d of h2.disposers) d()
 })
 
-test('host: an equivalent rule the user wrote themselves is not duplicated', async () => {
+test("host: the rule never touches the user's global AGENTS.md", async () => {
+  // v1 wrote ~/.dsh/AGENTS.md. v2 must reach the model without editing the user's file,
+  // which is what makes the rule both stronger and instant.
   const file = join(TEST_DSH_HOME, 'AGENTS.md')
-  const mine = '# 语言规则\n\n- 默认始终使用简体中文进行思考（reasoning）。\n'
+  const mine = '# 语言规则\n\n- 我自己写的：始终用简体中文思考。\n'
   writeFileSync(file, mine, 'utf8')
   const h = makeLineageCtx()
   apply(h.ctx)
   assert.equal(readFileSync(file, 'utf8'), mine, 'their file is left exactly as it was')
+  assert.equal(h.sections.length, 1, 'the rule still reaches the model, via the system prompt')
   const channel = h.routes.find((r) => r.path === '/diff-review')
   const status = rpcValue(await rpcCall(channel, 'thinking', {}))
   assert.equal(status.enabled, true)
-  assert.equal(status.injected, false)
-  assert.equal(status.equivalent, true, 'the settings page can say "already there"')
+  assert.equal(status.registered, true)
   rmSync(file, { force: true })
   for (const d of h.disposers) d()
 })
 
+test('host: review prefs round-trip through the RPC channel and settings.json', async () => {
+  const h = makeLineageCtx()
+  apply(h.ctx)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const defaults = rpcValue(await rpcCall(channel, 'prefs', {}))
+  assert.equal(defaults.ignoreWhitespace, false, 'whitespace noise stays visible until asked otherwise')
+  assert.equal(defaults.hideGitIgnored, true, 'git-ignored noise is hidden by default')
+
+  const next = rpcValue(await rpcCall(channel, 'prefs-set', { ignoreWhitespace: true, hideGitIgnored: false }))
+  assert.equal(next.ignoreWhitespace, true)
+  assert.equal(next.hideGitIgnored, false)
+  const onDisk = readPluginSettings(stateDirPath(h.ctx))
+  assert.equal(onDisk.ignoreWhitespace, true, 'persisted host-side')
+  assert.equal(onDisk.hideGitIgnored, false)
+
+  // A restart that reads those settings must boot into them, not the defaults.
+  const h2 = makeLineageCtx()
+  writePluginSettings(stateDirPath(h2.ctx), { ignoreWhitespace: true, hideGitIgnored: false })
+  apply(h2.ctx)
+  const channel2 = h2.routes.find((r) => r.path === '/diff-review')
+  const reloaded = rpcValue(await rpcCall(channel2, 'prefs', {}))
+  assert.equal(reloaded.ignoreWhitespace, true)
+  assert.equal(reloaded.hideGitIgnored, false)
+  for (const d of h.disposers) d()
+  for (const d of h2.disposers) d()
+})
+
 test('settings expose the Chinese-thinking switch, on by default', async () => {
-  let state = { ok: true, enabled: true, path: 'C:/x/.dsh/AGENTS.md', injected: false, equivalent: true }
+  let state = { ok: true, enabled: true, registered: true, section: ZH_THINKING_SECTION, order: ZH_THINKING_ORDER }
   const calls = []
   const c = loadRealClient(async (endpoint, payload) => {
     calls.push(endpoint)
     if (endpoint === 'thinking') return state
     if (endpoint === 'thinking-set') {
-      state = Object.assign({}, state, { enabled: payload.enabled === true, injected: payload.enabled === true, equivalent: false })
+      state = Object.assign({}, state, { enabled: payload.enabled === true, registered: payload.enabled === true })
       return state
     }
     return {}
@@ -2841,6 +2856,7 @@ test('settings expose the Chinese-thinking switch, on by default', async () => {
   assert.ok(box, 'the injection switch renders')
   assert.equal(box.props.checked, true, 'on by default')
   assert.match(c.collect(tree, 'drv-settings-hint')[0].children[0], /无需重启/, 'the hint answers "does this need a restart?"')
+  assert.match(c.collect(tree, 'drv-settings-note')[0].children[0], /系统提示词/, 'the note names where the rule actually goes')
   box.props.onChange({ target: { checked: false } })
   await new Promise((r) => setTimeout(r, 30))
   tree = c.render(section.Comp({}))
@@ -2939,4 +2955,166 @@ test('the review split view has a draggable divider that resizes the file list',
   // Double-click drops the dragged width and hands the pane back to CSS.
   c.collect(draw(), 'cdx-splitter')[0].props.onDoubleClick()
   assert.equal(c.collect(draw(), 'cdx-filelist')[0].props.style, undefined, 'double-click restores the responsive default')
+})
+
+test('host: str_replace_editor is recorded like write/edit', async () => {
+  // Its execute() returns only a success sentence — no {before, after} — so the pre-image
+  // has to be captured on tools/pre-execute. Without this the shell's changed-files card
+  // (which counts write, edit and mutating str_replace_editor) and this plugin disagree
+  // about which files a turn changed.
+  const dir = track(mkdtempSync(join(tmpdir(), 'drv-sre-')))
+  const file = join(dir, 'a.js')
+  writeFileSync(file, 'let a = 1;\nlet b = 2;\n', 'utf8')
+  const h = makeLineageCtx()
+  apply(h.ctx)
+  const agent = agentOf('sre-agent', { cwd: dir })
+  h.setLive(agent)
+
+  const exec = {
+    tool: 'str_replace_editor',
+    name: 'str_replace_editor',
+    input: { command: 'str_replace', path: file, old_str: 'let a = 1;', new_str: 'let a = 9;' },
+    agent
+  }
+  const pre = h.listeners.get('tools/pre-execute')[0]
+  assert.ok(pre, 'the pre-execute baseline capture is registered')
+  await pre(exec, () => Promise.resolve({ kind: 'allow' }))
+  // The tool's own effect, then its text-only result.
+  writeFileSync(file, 'let a = 9;\nlet b = 2;\n', 'utf8')
+  h.listeners.get('tools/result')[0](exec, { value: 'The file a.js has been edited successfully.' })
+
+  const stateDir = stateDirPath(h.ctx)
+  const shard = readdirSync(stateDir).find((f) => f.endsWith('.jsonl'))
+  assert.ok(shard, 'the edit reached a shard')
+  const rows = readFileSync(join(stateDir, shard), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  const opRows = rows.filter((r) => r.o)
+  assert.equal(opRows.length, 1, 'exactly one op recorded')
+  const op = opRows[0].o
+  assert.equal(op.kind, 'edit', 'str_replace is an edit, not a whole-file write')
+  assert.equal(op.before, 'let a = 1;\nlet b = 2;\n', 'the pre-image came from pre-execute')
+  assert.equal(op.after, 'let a = 9;\nlet b = 2;\n', 'the post-image is a re-read of the file')
+  assert.equal(op.oldString, 'let a = 1;')
+  assert.equal(op.newString, 'let a = 9;')
+  for (const d of h.disposers) d()
+})
+
+test('host: str_replace_editor view is not recorded', async () => {
+  // `view` is a read; counting it would put unchanged files on the card.
+  const dir = track(mkdtempSync(join(tmpdir(), 'drv-sre-view-')))
+  const file = join(dir, 'c.js')
+  writeFileSync(file, 'x\n', 'utf8')
+  const h = makeLineageCtx()
+  apply(h.ctx)
+  const agent = agentOf('sre-view', { cwd: dir })
+  h.setLive(agent)
+  const exec = { tool: 'str_replace_editor', name: 'str_replace_editor', input: { command: 'view', path: file }, agent }
+  await h.listeners.get('tools/pre-execute')[0](exec, () => Promise.resolve({ kind: 'allow' }))
+  h.listeners.get('tools/result')[0](exec, { value: '1  x' })
+  const stateDir = stateDirPath(h.ctx)
+  const shard = existsSync(stateDir) ? readdirSync(stateDir).find((f) => f.endsWith('.jsonl')) : undefined
+  assert.equal(shard, undefined, 'a read writes no shard')
+  for (const d of h.disposers) d()
+})
+
+test('host: /review-undo reverts the latest turn without a model turn', async () => {
+  // The card's 撤销 button only fills the composer with a diff_review_revert sequence;
+  // the command runs the same undo host-side, so it costs no tokens and never enters
+  // model history.
+  const dir = track(mkdtempSync(join(tmpdir(), 'drv-cmd-')))
+  const file = join(dir, 'b.js')
+  writeFileSync(file, 'v2\n', 'utf8')
+  const h = makeLineageCtx()
+  apply(h.ctx)
+  const cmd = h.commands.find((c) => c.name === 'review-undo')
+  assert.ok(cmd, '/review-undo is registered when the composition has a command registry')
+  const agent = agentOf('cmd-agent', { cwd: dir }, [{ type: 'turn/start', data: { turn: 3 } }])
+  h.setLive(agent)
+  // One recorded write with both sides, so the undo has a pre-image to restore.
+  h.listeners.get('tools/result')[0](
+    { tool: 'write', name: 'write', input: { file_path: file, content: 'v2\n' }, agent },
+    { value: { before: 'v1\n', after: 'v2\n' } }
+  )
+  const res = await cmd.handler({ agent, rawInput: '' })
+  assert.equal(res.kind, 'success', res.text)
+  assert.match(res.text, /第 3 轮/)
+  assert.equal(readFileSync(file, 'utf8'), 'v1\n', 'the file is back to its pre-image')
+  for (const d of h.disposers) d()
+})
+
+test('host: /review-undo with a path reverts just that file', async () => {
+  const dir = track(mkdtempSync(join(tmpdir(), 'drv-cmd-path-')))
+  const file = join(dir, 'd.js')
+  writeFileSync(file, 'second\n', 'utf8')
+  const h = makeLineageCtx()
+  apply(h.ctx)
+  const cmd = h.commands.find((c) => c.name === 'review-undo')
+  const agent = agentOf('cmd-path', { cwd: dir }, [{ type: 'turn/start', data: { turn: 1 } }])
+  h.setLive(agent)
+  h.listeners.get('tools/result')[0](
+    { tool: 'write', name: 'write', input: { file_path: file, content: 'second\n' }, agent },
+    { value: { before: 'first\n', after: 'second\n' } }
+  )
+  const res = await cmd.handler({ agent, rawInput: file })
+  assert.equal(res.kind, 'success', res.text)
+  assert.equal(readFileSync(file, 'utf8'), 'first\n')
+  const missing = await cmd.handler({ agent, rawInput: join(dir, 'nope.js') })
+  assert.equal(missing.kind, 'error', 'an unknown path reports instead of throwing')
+  for (const d of h.disposers) d()
+})
+
+test('host: the undo-turn endpoint reverts one turn host-side', async () => {
+  // This is what the card's 撤销 button calls: one turn undone without a model turn and
+  // without a composer round trip.
+  const dir = track(mkdtempSync(join(tmpdir(), 'drv-undo-turn-')))
+  const file = join(dir, 'e.js')
+  writeFileSync(file, 'after\n', 'utf8')
+  const h = makeLineageCtx()
+  apply(h.ctx)
+  const agent = agentOf('undo-turn-agent', { cwd: dir }, [{ type: 'turn/start', data: { turn: 4 } }])
+  h.setLive(agent)
+  h.listeners.get('tools/result')[0](
+    { tool: 'write', name: 'write', input: { file_path: file, content: 'after\n' }, agent },
+    { value: { before: 'before\n', after: 'after\n' } }
+  )
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  const res = rpcValue(await rpcCall(channel, 'undo-turn', { session: 'undo-turn-agent', turn: 4 }))
+  assert.equal(res.ok, true, JSON.stringify(res))
+  assert.match(res.message, /第 4 轮/)
+  assert.equal(readFileSync(file, 'utf8'), 'before\n', 'the file went back to its pre-image')
+  // a turn with nothing recorded reports instead of silently succeeding
+  const empty = rpcValue(await rpcCall(channel, 'undo-turn', { session: 'undo-turn-agent', turn: 99 }))
+  assert.equal(empty.ok, false)
+  for (const d of h.disposers) d()
+})
+
+test('the card 撤销 button arms before it reverts', async () => {
+  // Reverting is destructive and now runs on a single click, so the first click only
+  // arms the button — nothing reaches the host until the second one.
+  const calls = []
+  const file = { path: 'src/a.js', name: 'a.js', cwd: 'D:/ws', ops: 1, writes: 1, edits: 0, added: 1, removed: 0, lastTime: 9 }
+  const c = loadRealClient(async (endpoint) => {
+    calls.push(endpoint)
+    if (endpoint === 'editors') return { editors: [] }
+    if (endpoint === 'summary') return { files: [file], latestTurn: 5 }
+    if (endpoint === 'turn') return { turn: 5, files: [file] }
+    if (endpoint === 'undo-turn') return { ok: true, message: '已撤回第 5 轮的修改（1 个文件）' }
+    if (endpoint === 'session/list') return { result: { ok: true, value: { items: [{ sessionId: 'session-root', cwd: 'D:/ws', projections: { asOfSeq: 1 } }] } } }
+    if (endpoint === 'session/page') return { result: { ok: true, value: { records: [] } } }
+    return {}
+  })
+  const tail = c.slotComp('conversation.chat.turnTail')
+  const props = { sessionId: 'session-root', turn: { turn: 5 }, seq: 3, openFile: () => {} }
+  c.render(tail.Comp(props))
+  await new Promise((r) => setTimeout(r, 40))
+  let btn = c.collect(c.render(tail.Comp(props)), 'cdx-cf-btn')[0]
+  assert.ok(btn, 'the 撤销 button renders')
+
+  await btn.props.onClick({ stopPropagation() {} })
+  btn = c.collect(c.render(tail.Comp(props)), 'cdx-cf-btn')[0]
+  assert.match(String(btn.props.className), /cdx-cf-btn-armed/, 'the first click only arms it')
+  assert.equal(calls.includes('undo-turn'), false, 'nothing was reverted on the first click')
+
+  await btn.props.onClick({ stopPropagation() {} })
+  await new Promise((r) => setTimeout(r, 30))
+  assert.equal(calls.includes('undo-turn'), true, 'the second click asked the host to revert')
 })

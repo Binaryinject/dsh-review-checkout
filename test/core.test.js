@@ -1,18 +1,20 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, rmSync, truncateSync, existsSync, utimesSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import {
-  adoptBigSides, adoptSide, agentsFilePath, applyZhThinking, blobIdOf, cap, collectBlobRefs,
-  detectEditors, diffHunks, diffLines, exactSideOf, fullSideOf, gcBlobs, isInsideOpenWorkspace,
-  isSafeRecordedPath, latestWindowOf, loadSessions, loadShards, loadStateInto, merge3,
+  adoptBigSides, adoptSide, blobIdOf, cap, collectBlobRefs,
+  detectEditors, diffHunks, diffLines, exactSideOf, fullSideOf, gcBlobs, isGitIgnored,
+  isInsideOpenWorkspace, isSafeRecordedPath, latestWindowOf, loadSessions, loadShards, loadStateInto, merge3,
   offloadInlineSnapshots, opCounts, openWorkspaceRoots, opInLatestWindow, packText, previewRowsOf,
-  readBlob, readPluginSettings, rebuildCutSides, revertTextOf, serializeSessions, sessionUsage,
+  readBlob, readPluginSettings, readReviewPrefs, rebuildCutSides, resetGitIgnoreCache, revertTextOf, serializeSessions, sessionUsage,
   sessionWorkspaceRoot, setActiveStateDir, settingsFilePath, shardNameOf, shrinkForShard, splitLines,
-  stateDirPath, statsOf, storeBlob, stripZhBlock, unrecoverableCut, unpackText, withinTree,
-  writeJsonAtomicSync, writePluginSettings, ZH_THINKING_BLOCK, zhThinkingStatus
+  stateDirPath, statsOf, storeBlob, unrecoverableCut, unpackText, withinTree, writeJsonAtomicSync,
+  writePluginSettings, writeReviewPrefs, wsKey, ZH_THINKING_ORDER, ZH_THINKING_RULE, ZH_THINKING_SECTION,
+  zhThinkingStatus
 } from '../lib/index.js'
 
 test('cap truncates at MAX_CHARS and stringifies non-strings', () => {
@@ -690,66 +692,26 @@ test('a shard whose dead lines outgrow its records is compacted once on load', (
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('applyZhThinking: creates the rule, is idempotent, and never duplicates one the user wrote', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'zh-'))
-  const file = join(dir, 'AGENTS.md')
+test('the Chinese-thinking rule is a system-prompt section, not a file edit', () => {
+  // It used to live in ~/.dsh/AGENTS.md. That reached the model as a self-subordinating
+  // user message and was read only at a session's first step; the section form is what
+  // arrives at developer authority and re-registers on every step.
+  assert.equal(ZH_THINKING_SECTION, 'dsh-review-checkout:zh-thinking')
+  assert.ok(ZH_THINKING_ORDER > 10200, 'registered after DEPLOYMENT_PERSONA_SUFFIX (10200), so it is last')
+  assert.match(ZH_THINKING_RULE, /# 语言规则/)
+  assert.match(ZH_THINKING_RULE, /推理过程（reasoning \/ thinking）必须使用简体中文/, 'reasoning is named explicitly')
+  assert.doesNotMatch(ZH_THINKING_RULE, /\{\{/, 'the rule is literal prose, never a template')
 
-  // Nothing there yet → create it with our marked paragraph.
-  let res = applyZhThinking(true, file)
-  assert.equal(res.ok, true)
-  assert.equal(res.changed, true)
-  assert.equal(res.created, true)
-  assert.ok(readFileSync(file, 'utf8').includes(ZH_THINKING_BLOCK))
-  assert.equal(zhThinkingStatus(true, file).injected, true)
-
-  // Idempotent: a second run has nothing to write.
-  res = applyZhThinking(true, file)
-  assert.equal(res.changed, false)
-
-  // The user already stated the same rule themselves (this profile's own file does):
-  // report it and DO NOT duplicate it.
-  const mine = join(dir, 'mine.md')
-  writeFileSync(mine, '# 语言规则\n\n- 默认始终使用简体中文进行思考（reasoning）。\n', 'utf8')
-  const before = readFileSync(mine, 'utf8')
-  res = applyZhThinking(true, mine)
-  assert.equal(res.alreadyPresent, true)
-  assert.equal(res.changed, false)
-  assert.equal(readFileSync(mine, 'utf8'), before, 'not one byte of the user file changed')
-
-  // Other content of theirs → our paragraph is appended after it, theirs intact.
-  const other = join(dir, 'other.md')
-  writeFileSync(other, '# 项目规则\n\n- 用 2 空格缩进\n', 'utf8')
-  res = applyZhThinking(true, other)
-  assert.equal(res.changed, true)
-  const withBlock = readFileSync(other, 'utf8')
-  assert.ok(withBlock.startsWith('# 项目规则'), 'their content stays first')
-  assert.ok(withBlock.includes('用 2 空格缩进'))
-  assert.ok(withBlock.includes(ZH_THINKING_BLOCK))
-
-  // Switching off removes exactly our paragraph.
-  res = applyZhThinking(false, other)
-  assert.equal(res.removed, true)
-  assert.equal(readFileSync(other, 'utf8'), '# 项目规则\n\n- 用 2 空格缩进\n', 'their content survives removal')
-
-  // A file that held nothing but our paragraph (we created it) goes away entirely.
-  res = applyZhThinking(false, file)
-  assert.equal(res.removed, true)
-  assert.equal(existsSync(file), false)
-
-  // A file with no paragraph of ours is not touched at all.
-  const untouched = join(dir, 'keep.md')
-  writeFileSync(untouched, '# 别的\n', 'utf8')
-  res = applyZhThinking(false, untouched)
-  assert.equal(res.changed, false)
-  assert.equal(res.removed, false)
-  assert.equal(readFileSync(untouched, 'utf8'), '# 别的\n')
-
-  // stripZhBlock leaves a clean file when it removes a middle paragraph.
-  const three = stripZhBlock('# a\n\n' + ZH_THINKING_BLOCK + '\n\n# b\n')
-  assert.equal(three.removed, true)
-  assert.equal(three.text, '# a\n\n# b\n')
-  assert.equal(stripZhBlock('# a\n').removed, false)
-  rmSync(dir, { recursive: true, force: true })
+  // The status shape the Settings page renders: on-but-unregistered must be visible.
+  const on = zhThinkingStatus(true, true, undefined)
+  assert.equal(on.ok, true)
+  assert.equal(on.enabled, true)
+  assert.equal(on.registered, true)
+  assert.equal(on.section, ZH_THINKING_SECTION)
+  assert.equal(on.order, ZH_THINKING_ORDER)
+  assert.equal(zhThinkingStatus(true, false, 'systemPrompt 服务不可用').ok, false)
+  assert.equal(zhThinkingStatus(true, false, 'systemPrompt 服务不可用').registered, false)
+  assert.equal(zhThinkingStatus(false, false, undefined).enabled, false)
 })
 
 test('plugin settings round-trip next to the shards, and loadShards ignores them', () => {
@@ -763,6 +725,109 @@ test('plugin settings round-trip next to the shards, and loadShards ignores them
   assert.equal(loadShards(sessions, dir).shards, 0)
   assert.equal(sessions.size, 0)
   rmSync(dir, { recursive: true, force: true })
+})
+
+test('review prefs: ignoreWhitespace defaults off, hideGitIgnored defaults on', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'review-prefs-'))
+  assert.deepEqual(readReviewPrefs(dir), { ignoreWhitespace: false, hideGitIgnored: true })
+  assert.equal(writeReviewPrefs(dir, { ignoreWhitespace: true, hideGitIgnored: false }), true)
+  assert.deepEqual(readReviewPrefs(dir), { ignoreWhitespace: true, hideGitIgnored: false })
+  // Partial patch leaves the other key alone; zhThinking stays untouched.
+  writePluginSettings(dir, Object.assign({}, readPluginSettings(dir), { zhThinking: true }))
+  writeReviewPrefs(dir, { ignoreWhitespace: false })
+  assert.deepEqual(readReviewPrefs(dir), { ignoreWhitespace: false, hideGitIgnored: false })
+  assert.equal(readPluginSettings(dir).zhThinking, true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('wsKey strips every whitespace so git -w style matching works', () => {
+  assert.equal(wsKey('  foo bar  '), wsKey('foobar'))
+  assert.equal(wsKey('a\tb\n c'), wsKey('abc'))
+  assert.notEqual(wsKey('foo bar'), wsKey('foo baz'))
+  assert.equal(wsKey(null), '')
+})
+
+test('diffLines: ignoreWhitespace folds whitespace-only edits into context', () => {
+  const opts = { ignoreWhitespace: true }
+  // Indent change only — must not read as del+add.
+  const indent = diffLines(['if (x) {', '  return 1', '}'], ['if (x) {', '\treturn 1', '}'], 1, 1, opts)
+  assert.deepEqual(indent.map((h) => h.type), ['ctx', 'ctx', 'ctx'])
+  assert.equal(indent[1].text, '\treturn 1', 'context keeps the NEW side text')
+
+  // Trailing space only.
+  const trail = diffLines(['a', 'b '], ['a', 'b'], 1, 1, opts)
+  assert.deepEqual(trail.map((h) => h.type), ['ctx', 'ctx'])
+
+  // A real change still shows.
+  const real = diffLines(['a', 'b'], ['a', 'c'], 1, 1, opts)
+  assert.deepEqual(real.map((h) => h.type), ['ctx', 'del', 'add'])
+
+  // Without the flag the indent change is still del+add.
+  const strict = diffLines(['  x'], ['\tx'], 1, 1)
+  assert.deepEqual(strict.map((h) => h.type), ['del', 'add'])
+})
+
+test('statsOf / opCounts honor ignoreWhitespace and skip the stored per-op counts', () => {
+  const wsOnly = [{ kind: 'edit', at: 1, turn: 1, before: '  a\nb', after: '\ta\nb', oldString: '  a', newString: '\ta', added: 1, removed: 1 }]
+  // Exact endpoint diff under ignoreWhitespace → +0 −0, not the stored 1/1.
+  assert.deepEqual(
+    { added: statsOf(wsOnly, 'f', { ignoreWhitespace: true }).added, removed: statsOf(wsOnly, 'f', { ignoreWhitespace: true }).removed },
+    { added: 0, removed: 0 }
+  )
+  // Without the flag the same record keeps its exact 1/1.
+  assert.deepEqual(
+    { added: statsOf(wsOnly, 'f').added, removed: statsOf(wsOnly, 'f').removed },
+    { added: 1, removed: 1 }
+  )
+  // Fragment fallback also folds whitespace-only edits.
+  const noSnap = [{ kind: 'edit', oldString: '  a\nb', newString: '\ta\nb', added: 1, removed: 1 }]
+  assert.deepEqual(statsOf(noSnap, 'g', { ignoreWhitespace: true }), { added: 0, removed: 0, writes: 0, edits: 1, estimated: true })
+  assert.deepEqual(opCounts({ kind: 'edit', oldString: '  a', newString: '\ta' }, { ignoreWhitespace: true }), { added: 0, removed: 0 })
+  assert.deepEqual(opCounts({ kind: 'edit', oldString: '  a', newString: '\ta' }), { added: 1, removed: 1 })
+})
+
+test('isGitIgnored defers to git check-ignore (.gitignore, nested rules)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'git-ignore-'))
+  try {
+    execFileSync('git', ['init', '-q'], { cwd: dir, windowsHide: true, stdio: 'ignore' })
+    writeFileSync(join(dir, '.gitignore'), 'node_modules/\n*.min.js\n')
+    mkdirSync(join(dir, 'src'), { recursive: true })
+    writeFileSync(join(dir, 'src', '.gitignore'), 'generated.js\n')
+    writeFileSync(join(dir, 'src', 'app.js'), '')
+    writeFileSync(join(dir, 'src', 'generated.js'), '')
+    writeFileSync(join(dir, 'bundle.min.js'), '')
+    mkdirSync(join(dir, 'node_modules', 'x'), { recursive: true })
+    writeFileSync(join(dir, 'node_modules', 'x', 'index.js'), '')
+    resetGitIgnoreCache()
+
+    assert.equal(isGitIgnored(join(dir, 'src', 'app.js'), dir), false, 'tracked source stays visible')
+    assert.equal(isGitIgnored(join(dir, 'src', 'generated.js'), dir), true, 'nested .gitignore applies')
+    assert.equal(isGitIgnored(join(dir, 'bundle.min.js'), dir), true, 'extension pattern applies')
+    assert.equal(isGitIgnored(join(dir, 'node_modules', 'x', 'index.js'), dir), true, 'directory pattern applies')
+    // Cache: second call is a hit and agrees.
+    assert.equal(isGitIgnored(join(dir, 'src', 'app.js'), dir), false)
+  } catch (e) {
+    if (String(e && e.message).includes('git')) {
+      // No git on PATH: the filter must simply not hide anything.
+      resetGitIgnoreCache()
+      assert.equal(isGitIgnored(join(dir, 'bundle.min.js'), dir), false)
+    } else throw e
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    resetGitIgnoreCache()
+  }
+})
+
+test('isGitIgnored never hides a path outside a repo', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'no-repo-'))
+  try {
+    writeFileSync(join(dir, 'note.js'), '')
+    resetGitIgnoreCache()
+    assert.equal(isGitIgnored(join(dir, 'note.js'), dir), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    resetGitIgnoreCache()
+  }
 })
 
 test('adoptSide / adoptBigSides: big complete sides get a blob ref, cut sides never do', () => {
