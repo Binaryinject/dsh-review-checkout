@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
-import { apply, isLoopbackRequest, inject, launchEditor, loadShards, locateFragment, fontFamiliesFromRegistry, fontFamiliesFromRegistryName, fontFamiliesFromFcList, readBlob, readPluginSettings, revertTextOf, settingsFilePath, shardNameOf, stateDirPath, writePluginSettings, ZH_THINKING_ORDER, ZH_THINKING_RULE, ZH_THINKING_SECTION } from '../lib/index.js'
+import { apply, admissionRejection, isLoopbackRequest, inject, launchEditor, loadShards, locateFragment, fontFamiliesFromRegistry, fontFamiliesFromRegistryName, fontFamiliesFromFcList, readBlob, readPluginSettings, revertTextOf, settingsFilePath, shardNameOf, stateDirPath, writePluginSettings, ZH_THINKING_ORDER, ZH_THINKING_RULE, ZH_THINKING_SECTION } from '../lib/index.js'
 
 /** Sandboxed profile dir per test, so flushes never touch real user data.
  *  The trailing slash matters: a backslash encodes to %5C (a plain character,
@@ -48,7 +48,7 @@ function clientFunction(name) {
 /** Minimal Cordis ctx with an official-shape webServer. `sessionStore` and
  *  `workspaceRegistry` are the two extra faces the path fence resolves a session's
  *  cwd through when no live agent exists. */
-function makeCtx({ withWebServer = true, sessionStore = null, workspaceRegistry = null } = {}) {
+function makeCtx({ withWebServer = true, sessionStore = null, workspaceRegistry = null, connection = null } = {}) {
   const listeners = new Map()
   const disposers = []
   const routes = []
@@ -118,6 +118,7 @@ function makeCtx({ withWebServer = true, sessionStore = null, workspaceRegistry 
       if (name === 'commands') return commandsService
       if (name === 'sessions') return sessionStore || undefined
       if (name === 'workspaceRegistry') return workspaceRegistry || undefined
+      if (name === 'connection') return connection || undefined
       return undefined
     },
     // Cordis semantics: a dependent fiber body runs once every injected
@@ -996,6 +997,56 @@ test('isLoopbackRequest fence accepts loopback and rejects foreign hosts', () =>
   assert.equal(isLoopbackRequest({ headers: { host: '127.0.0.1:43120', origin: 'http://evil.example.com' } }), false)
   assert.equal(isLoopbackRequest({ headers: { host: '127.0.0.1:43120', origin: 'http://127.0.0.1:43120' } }), true)
   assert.equal(isLoopbackRequest({ headers: { host: '127.0.0.1:43120', 'sec-fetch-site': 'cross-site' } }), false)
+})
+
+test('admissionRejection maps the official status and tolerates a missing service', () => {
+  assert.equal(admissionRejection({ get: () => ({ requestRejection: () => 403 }) }, {}), 403)
+  assert.equal(admissionRejection({ get: () => ({ requestRejection: () => 401 }) }, {}), 401)
+  assert.equal(admissionRejection({ get: () => ({ requestRejection: () => undefined }) }, {}), 0)
+  assert.equal(admissionRejection({ get: () => ({}) }, {}), 0)
+  assert.equal(admissionRejection({ get: () => undefined }, {}), 0)
+  assert.equal(admissionRejection(null, {}), 0)
+  assert.equal(admissionRejection({ get: () => ({ requestRejection: () => { throw new Error('boom') } }) }, {}), 0)
+})
+
+/** A POST with caller-chosen headers; returns only the status the handler wrote. */
+function postWithHeaders(channel, url, headers) {
+  const req = {
+    method: 'POST',
+    url,
+    headers: { 'content-type': 'application/json', ...headers },
+    [Symbol.asyncIterator]() {
+      return { next: () => Promise.resolve({ value: undefined, done: true }) }
+    }
+  }
+  let status = 0
+  const res = { writeHead(code) { status = code }, end() {} }
+  return channel.handler(req, res).then(() => status)
+}
+
+test('the route honours DSH admission when the connection service exists', async () => {
+  // The registry entry used to say these HTTP routes had no DSH access check.
+  // The Web composition provides `connection`, whose requestRejection is the
+  // official Host/Origin fence plus authenticated-Peer admission.
+  const h = makeCtx({ connection: { requestRejection: (req) => (req.headers['x-admit'] === 'deny' ? 403 : undefined) } })
+  apply(h.ctx)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  assert.ok(channel, 'route registered')
+  const denied = await postWithHeaders(channel, '/diff-review/turn', { host: '127.0.0.1:43120', 'x-admit': 'deny' })
+  assert.equal(denied, 403, 'connection.requestRejection decides before the handler body')
+  for (const d of h.disposers) assert.doesNotThrow(() => d())
+})
+
+test('without the connection service a foreign Host is still refused', async () => {
+  // Desktop composition: no connection service, so the loopback fence is the
+  // only guard — and it must still refuse a foreign Host.
+  const h = makeCtx()
+  apply(h.ctx)
+  const channel = h.routes.find((r) => r.path === '/diff-review')
+  assert.ok(channel)
+  const refused = await postWithHeaders(channel, '/diff-review/turn', { host: 'evil.example.com' })
+  assert.equal(refused, 403, 'loopback fence still guards desktop')
+  for (const d of h.disposers) assert.doesNotThrow(() => d())
 })
 
 /** Minimal loopback POST + capturing response. `rawBody` is sent verbatim so a
